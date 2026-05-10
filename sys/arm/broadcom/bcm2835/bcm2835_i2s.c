@@ -223,7 +223,7 @@ bcm2835_i2s_attach(device_t dev)
 			    "no clocks property, continuing without clock control\n");
 		}
 	}
-
+	
 	error = bcm2835_i2s_init(sc);
 	if (error != 0)
 		goto fail;
@@ -402,7 +402,8 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 
 		sc->play_ptr += written;
 		sc->play_ptr %= size;
-		ret |= AUDIO_DAI_PLAY_INTR;
+		if (written > 0)
+			ret |= AUDIO_DAI_PLAY_INTR;
 	}
 
 	if (intstc & INTx_A_RXR) {
