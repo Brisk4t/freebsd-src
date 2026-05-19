@@ -9,7 +9,7 @@
  * The bcm2835 DTS node does not carry an interrupt specifier by default.
  * A DTS overlay must add one before this driver can be used:
  *
- *   &i2s { interrupts = <1 23>; };   -- GPU IRQ 55 (bank 1, bit 23)
+ *   &i2s { interrupts = <0 119 4>; };  -- GIC SPI 119 (GPU IRQ 55, bank2 bit23 + 96)
  *
  * Clock management is delegated to bcm2835_clkman, which must be loaded
  * first (MODULE_DEPEND enforces this).
@@ -65,32 +65,6 @@ static struct pcmchan_caps bcm2835_i2s_caps = {
 
 static int bcm2835_i2s_detach(device_t dev);
 
-/*
- * Wait for 'cycles' PCM clock periods using the CS_A SYNC bit.
- * Requires STBY=1 so the PCM clock is propagating through the block.
- * Each SYNC write+readback consumes 2 PCM clock periods, so the loop
- * runs ⌈cycles/2⌉ iterations.
- */
-static inline void
-bcm2835_pcm_wait(struct bcm2835_i2s_softc *sc, uint32_t cycles)
-{
-	uint32_t iter = (cycles + 1) / 2;
-	uint32_t val;
-	uint32_t sync_bit = 0;
-
-	val = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
-	if (val & CS_A_SYNC)
-		sync_bit = CS_A_SYNC;
-
-	while (iter-- > 0) {
-		sync_bit ^= CS_A_SYNC;
-		val = (val & ~CS_A_SYNC) | sync_bit;
-		BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, val);
-
-		while ((BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A) & CS_A_SYNC) != sync_bit)
-			cpu_spinwait();
-	}
-}
 
 static int
 bcm2835_i2s_probe(device_t dev)
@@ -279,7 +253,7 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_RXC_A, chc);
 
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_STBY);
-	bcm2835_pcm_wait(sc, 4);
+	DELAY(10); /* wait ≥4 PCM clocks (~3 MHz → ~1.3 µs) */
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_EN | CS_A_STBY);
 
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
@@ -406,19 +380,36 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 
 	switch (go) {
 	case PCMTRIG_START:
-		inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
-		if (pcm_dir == PCMDIR_PLAY)
-			inten |= INTx_A_TXW;
-		else
-			inten |= INTx_A_RXR;
-		BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten);
-
 		cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
-		if (pcm_dir == PCMDIR_PLAY)
-			cs |= CS_A_TXON | CS_A_TXCLR;
-		else
-			cs |= CS_A_RXON | CS_A_RXCLR;
-		BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs);
+		if (pcm_dir == PCMDIR_PLAY) {
+			/*
+			 * Clear the TX FIFO, then pre-fill it with silence.
+			 * TXCLR leaves the FIFO empty so TXW asserts and
+			 * latches into INTSTC_A immediately.  If we enable
+			 * INTEN_A with that latch set, the hardware interrupt
+			 * fires on another CPU core while chn_trigger() still
+			 * holds the channel lock, causing a mutex recursion
+			 * panic.  Filling the FIFO puts it above the TXW
+			 * threshold so the latch can be cleared before INTEN_A
+			 * is enabled, deferring the first interrupt until the
+			 * silence has been consumed and the lock is released.
+			 */
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXCLR);
+			for (int i = 0; i < 64; i++)
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A, 0);
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_TXW);
+			inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
+			    inten | INTx_A_TXW);
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXON);
+		} else {
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_RXR);
+			inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
+			    inten | INTx_A_RXR);
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
+			    cs | CS_A_RXON | CS_A_RXCLR);
+		}
 		break;
 
 	case PCMTRIG_STOP:
@@ -474,10 +465,16 @@ bcm2835_i2s_dai_setup_intr(device_t dev, driver_intr_t intr_handler,
     void *intr_arg)
 {
 	struct bcm2835_i2s_softc *sc = device_get_softc(dev);
+	int err;
 
-	if (bus_setup_intr(dev, sc->res[1],
+	device_printf(dev, "setup_intr: res[1]=%p handler=%p arg=%p\n",
+	    sc->res[1], intr_handler, intr_arg);
+	err = bus_setup_intr(dev, sc->res[1],
 	    INTR_TYPE_AV | INTR_MPSAFE, NULL, intr_handler, intr_arg,
-	    &sc->intrhand)) {
+	    &sc->intrhand);
+	device_printf(dev, "setup_intr: bus_setup_intr returned %d, cookie=%p\n",
+	    err, sc->intrhand);
+	if (err) {
 		device_printf(dev, "cannot setup interrupt handler\n");
 		return (ENXIO);
 	}

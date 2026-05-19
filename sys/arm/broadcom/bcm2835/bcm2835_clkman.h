@@ -28,11 +28,12 @@
 #ifndef	_BCM2835_CLKMAN_H_
 #define	_BCM2835_CLKMAN_H_
 
-// Offset into BAR0 for unit
+/* Offset into BAR0 for unit (CM_*CTL register address) */
 enum bcm2835_clksrc {
 	BCM_GPIO0_CLKSRC =	0x70,
 	BCM_GPIO1_CLKSRC =	0x78,
 	BCM_GPIO2_CLKSRC =	0x80,
+	BCM_PCM_CLKSRC =	0x98,
 	BCM_PWM_CLKSRC =	0xa0,
 };
 

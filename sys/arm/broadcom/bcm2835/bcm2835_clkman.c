@@ -125,7 +125,7 @@ bcm2835_clkman_set_frequency(device_t dev, uint32_t unit, uint32_t hz)
 
 	sc = device_get_softc(dev);
 
-	if (unit != BCM_PWM_CLKSRC) {
+	if (unit != BCM_PWM_CLKSRC && unit != BCM_PCM_CLKSRC) {
 		device_printf(sc->sc_dev,
 		    "Unsupported unit 0x%x", unit);
 		return (0);
