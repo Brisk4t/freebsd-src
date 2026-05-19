@@ -63,9 +63,6 @@ static struct pcmchan_caps bcm2835_i2s_caps = {
 	BCM2835_I2S_SAMPLING_RATE, BCM2835_I2S_SAMPLING_RATE, sc_fmt, 0
 };
 
-static int bcm2835_i2s_detach(device_t dev);
-
-
 static int
 bcm2835_i2s_probe(device_t dev)
 {
@@ -77,6 +74,27 @@ bcm2835_i2s_probe(device_t dev)
 
 	device_set_desc(dev, "BCM2835 I2S");
 	return (BUS_PROBE_DEFAULT);
+}
+
+static int
+bcm2835_i2s_detach(device_t dev)
+{
+	struct bcm2835_i2s_softc *sc;
+
+	sc = device_get_softc(dev);
+
+	if (sc->hw_started) {
+		BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, 0);
+		sc->hw_started = false;
+	}
+
+	if (sc->intrhand != NULL)
+		bus_teardown_intr(dev, sc->res[1], sc->intrhand);
+
+	bus_release_resources(dev, bcm2835_i2s_spec, sc->res);
+	mtx_destroy(&sc->mtx);
+
+	return (0);
 }
 
 static int
@@ -97,10 +115,7 @@ bcm2835_i2s_attach(device_t dev)
 		goto fail;
 	}
 
-	/*
-	 * Find the clock manager.  MODULE_DEPEND on bcm2835_clkman ensures
-	 * it is loaded before us.
-	 */
+	/* Find the clock manager */
 	sc->clkman = devclass_get_device(devclass_find("bcm2835_clkman"), 0);
 	if (sc->clkman == NULL) {
 		device_printf(dev, "cannot find bcm2835_clkman\n");
@@ -136,26 +151,6 @@ fail:
 	return (error);
 }
 
-static int
-bcm2835_i2s_detach(device_t dev)
-{
-	struct bcm2835_i2s_softc *sc;
-
-	sc = device_get_softc(dev);
-
-	if (sc->hw_started) {
-		BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, 0);
-		sc->hw_started = false;
-	}
-
-	if (sc->intrhand != NULL)
-		bus_teardown_intr(dev, sc->res[1], sc->intrhand);
-
-	bus_release_resources(dev, bcm2835_i2s_spec, sc->res);
-	mtx_destroy(&sc->mtx);
-
-	return (0);
-}
 
 static int
 bcm2835_i2s_dai_init(device_t dev, uint32_t format)
@@ -322,8 +317,7 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 
 		sc->play_ptr += written;
 		sc->play_ptr %= size;
-		if (written > 0)
-			ret |= AUDIO_DAI_PLAY_INTR;
+		ret |= AUDIO_DAI_PLAY_INTR;
 	}
 
 	if (intstc & INTx_A_RXR) {

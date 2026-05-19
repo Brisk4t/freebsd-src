@@ -8,6 +8,4 @@ SRCS+=	audio_dai_if.h
 SRCS+=	opt_platform.h opt_sound.h opt_snd.h
 SRCS+=	channel_if.h
 
- 
-
 .include <bsd.kmod.mk>
