@@ -393,22 +393,29 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 			 * threshold so the latch can be cleared before INTEN_A
 			 * is enabled, deferring the first interrupt until the
 			 * silence has been consumed and the lock is released.
+			 *
+			 * Always OR in CS_A_EN: PCMTRIG_STOP clears EN so
+			 * that the block is fully gated when idle, meaning cs
+			 * read back here may not have it set on the second and
+			 * subsequent plays.
 			 */
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXCLR);
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
+			    cs | CS_A_EN | CS_A_TXCLR);
 			for (int i = 0; i < 64; i++)
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A, 0);
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_TXW);
 			inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
 			    inten | INTx_A_TXW);
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXON);
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
+			    cs | CS_A_EN | CS_A_TXON);
 		} else {
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_RXR);
 			inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
 			    inten | INTx_A_RXR);
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
-			    cs | CS_A_RXON | CS_A_RXCLR);
+			    cs | CS_A_EN | CS_A_RXON | CS_A_RXCLR);
 		}
 		break;
 
@@ -465,16 +472,10 @@ bcm2835_i2s_dai_setup_intr(device_t dev, driver_intr_t intr_handler,
     void *intr_arg)
 {
 	struct bcm2835_i2s_softc *sc = device_get_softc(dev);
-	int err;
 
-	device_printf(dev, "setup_intr: res[1]=%p handler=%p arg=%p\n",
-	    sc->res[1], intr_handler, intr_arg);
-	err = bus_setup_intr(dev, sc->res[1],
+	if (bus_setup_intr(dev, sc->res[1],
 	    INTR_TYPE_AV | INTR_MPSAFE, NULL, intr_handler, intr_arg,
-	    &sc->intrhand);
-	device_printf(dev, "setup_intr: bus_setup_intr returned %d, cookie=%p\n",
-	    err, sc->intrhand);
-	if (err) {
+	    &sc->intrhand)) {
 		device_printf(dev, "cannot setup interrupt handler\n");
 		return (ENXIO);
 	}
