@@ -82,7 +82,7 @@ bcm2835_clkman_probe(device_t dev)
 	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
 		return (ENXIO);
 
-	device_set_desc(dev, "BCM283x Clock Manager - New");
+	device_set_desc(dev, "BCM283x Clock Manager");
 
 	return (BUS_PROBE_DEFAULT);
 }
@@ -125,10 +125,9 @@ bcm2835_clkman_set_frequency(device_t dev, uint32_t unit, uint32_t hz)
 
 	sc = device_get_softc(dev);
 
-	if (unit != BCM_PCM_CLKSRC && unit != BCM_PWM_CLKSRC &&
-	    unit != BCM_GPIO0_CLKSRC && unit != BCM_GPIO1_CLKSRC &&
-	    unit != BCM_GPIO2_CLKSRC) {
-		device_printf(sc->sc_dev, "Unsupported unit 0x%x\n", unit);
+	if (unit != BCM_PWM_CLKSRC) {
+		device_printf(sc->sc_dev,
+		    "Unsupported unit 0x%x", unit);
 		return (0);
 	}
 
