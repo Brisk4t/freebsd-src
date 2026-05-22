@@ -132,31 +132,47 @@ bcm2835_i2s_attach(device_t dev)
 	 * Start the PCM clock before touching any I2S registers.  Without a
 	 * running clock the APB bus stalls on the first register access,
 	 * producing a synchronous data abort on arm64.  hw_started is set
-	 * here so that detach knows register accesses are safe.
+	 * immediately after so that detach knows register accesses are safe
+	 * if any later step fails.
 	 *
 	 * Full block initialisation (MODE_A, TXC_A, RXC_A, EN/STBY) is
-	 * deferred to dai_init where the frame format is known, ensuring
-	 * those registers are written before the block is enabled.
+	 * deferred to dai_init where the frame format is known.
 	 */
-	
 	if (bcm2835_clkman_set_frequency(sc->clkman, BCM_PCM_CLKSRC,
 	    BCM2835_I2S_SAMPLING_RATE * BCM2835_I2S_FRAME_LEN) == 0) {
 		device_printf(dev, "cannot set PCM clock\n");
 		error = ENXIO;
 		goto fail;
 	}
+	sc->hw_started = true;
 
+	/*
+	 * Pre-initialise to BCM_DMA_CH_INVALID so that a partial failure
+	 * (one channel allocated, the other not) is detectable.
+	 */
+	sc->dma_chan_rx = BCM_DMA_CH_INVALID;
+	sc->dma_chan_tx = BCM_DMA_CH_INVALID;
 
-	// Dma stuff
-	sc->dma_chan_rx = bcm_dma_allocate(-1);
-	sc->dma_chan_tx = bcm_dma_allocate(-1);
-	if (sc->dma_chan_rx == -1 || sc->dma_chan_tx == -1) {
+	sc->dma_chan_rx = bcm_dma_allocate(BCM_DMA_CH_ANY);
+	sc->dma_chan_tx = bcm_dma_allocate(BCM_DMA_CH_ANY);
+	if (sc->dma_chan_rx == BCM_DMA_CH_INVALID ||
+	    sc->dma_chan_tx == BCM_DMA_CH_INVALID) {
 		device_printf(dev, "cannot allocate DMA channels\n");
 		error = ENXIO;
 		goto fail;
 	}
 
-	sc->hw_started = true;
+	/* TX channel: system memory → I2S FIFO (DREQ-paced, fixed dest addr) */
+	bcm_dma_setup_src(sc->dma_chan_tx, BCM_DMA_DREQ_NONE,
+	    BCM_DMA_INC_ADDR, BCM_DMA_32BIT);
+	bcm_dma_setup_dst(sc->dma_chan_tx, BCM2835_I2S_DREQ_TX,
+	    BCM_DMA_SAME_ADDR, BCM_DMA_32BIT);
+
+	/* RX channel: I2S FIFO → system memory (DREQ-paced, fixed src addr) */
+	bcm_dma_setup_src(sc->dma_chan_rx, BCM2835_I2S_DREQ_RX,
+	    BCM_DMA_SAME_ADDR, BCM_DMA_32BIT);
+	bcm_dma_setup_dst(sc->dma_chan_rx, BCM_DMA_DREQ_NONE,
+	    BCM_DMA_INC_ADDR, BCM_DMA_32BIT);
 
 	node = ofw_bus_get_node(dev);
 	OF_device_register_xref(OF_xref_from_node(node), dev);
@@ -270,29 +286,27 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_TXC_A, chc);
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_RXC_A, chc);
 		
-	// Control register setup and enable
-
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_STBY);
-	DELAY(10); /* wait ≥4 PCM clocks (~3 MHz → ~1.3 µs) */
-	
-	// Assert to clear FIFOs
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_TXCLR | CS_A_RXCLR);
-	
-	/* DMA does not need interrupts(?)*/
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, 0); 
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, 0xFFFFFFFF); /* clear any pending */ 
-
-
-	/* TXTHR=01: TXW fires when FIFO < 3/4 full (≥16 free slots).
-	 * RXTHR=01: RXR fires when FIFO ≥ 1/4 full (≥16 entries).
+	/*
+	 * BCM2835 §CS_A note: only the bottom 3 bits (EN, RXON, TXON) may be
+	 * written while the block is running.  TXCLR/RXCLR (bits 3-4) require
+	 * EN=0.  STBY is kept set to avoid de-asserting it and needing another
+	 * 4-clock wait before the subsequent enable.
 	 */
 
+	// Clear FIFOs before enabling PCM block
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_TXCLR | CS_A_RXCLR);
+
+	/* DMA completion is signalled via the DMA engine, not the I2S IRQ. */
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, 0);
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_ALL);
+
+	/* TX DREQ fires when FIFO level ≤ 16; RX DREQ fires when level ≥ 48. */
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_DREQ_A,
+	    DREQ_A_TX_PANIC(0x10) | DREQ_A_RX_PANIC(0x30) |
+	    DREQ_A_TX(0x10)       | DREQ_A_RX(0x30));
+
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
-	    CS_A_EN | 
-		CS_A_STBY | 
-		CS_A_TXTHR(1) | 
-		CS_A_RXTHR(1)
-	);
+	    CS_A_EN | CS_A_STBY | CS_A_DMAEN);
 
 	return (0);
 }
