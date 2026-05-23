@@ -102,6 +102,8 @@ struct bcm2835_i2s_softc {
 	uint32_t		 play_ptr;
 	uint32_t		 rec_ptr;
 	bool			 hw_started; /* true once PCM clock is running (register accesses safe) */
+	int			 dma_chan_tx; /* TX DMA channel (BCM_DMA_CH_INVALID if unallocated) */
+	int			 dma_chan_rx; /* RX DMA channel (BCM_DMA_CH_INVALID if unallocated) */
 };
 
 #endif /* _BCM2835_I2S_H_ */

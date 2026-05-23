@@ -39,7 +39,7 @@
 #include "audio_dai_if.h"
 
 
-#include "bcm2835_i2s.h"
+#include "bcm2835_i2s_dma.h"
 
 static struct ofw_compat_data compat_data[] = {
 	{ "brcm,bcm2835-i2s",	1 },
@@ -91,6 +91,11 @@ bcm2835_i2s_detach(device_t dev)
 		BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, 0);
 		sc->hw_started = false;
 	}
+
+	if (sc->dma_chan_tx != BCM_DMA_CH_INVALID)
+		bcm_dma_free(sc->dma_chan_tx);
+	if (sc->dma_chan_rx != BCM_DMA_CH_INVALID)
+		bcm_dma_free(sc->dma_chan_rx);
 
 	if (sc->intrhand != NULL)
 		bus_teardown_intr(dev, sc->res[1], sc->intrhand);
@@ -316,88 +321,92 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
     struct snd_dbuf *rec_buf)
 {
 	struct bcm2835_i2s_softc *sc;
-	uint32_t intstc, cs, val;
+	uint32_t status, inten, val;
+	uint8_t *samples;
+	uint32_t count, size, rp, written;
 	int ret = 0;
 
 	sc = device_get_softc(dev);
-
 	BCM2835_I2S_LOCK(sc);
 
-	intstc = BCM2835_I2S_READ_4(sc, BCM_I2S_INTSTC_A);
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, intstc);	/* W1C */
+	status = BCM2835_I2S_READ_4(sc, BCM_I2S_INTSTC_A);
+	inten  = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
 
-	if (intstc & INTx_A_TXW) {
-		uint8_t *samples;
-		uint32_t count, size, readyptr, written;
+	/*
+	 * TX: FIFO empty (TXTHR=00 default).  Each stereo frame occupies
+	 * two 32-bit FIFO words: one for CH1 (left) and one for CH2 (right),
+	 * each carrying the 16-bit sample right-justified.
+	 */
+	if ((status & inten & INTx_A_TXW) && play_buf != NULL) {
+		BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_TXW);
 
-		count    = sndbuf_getready(play_buf);
-		size     = play_buf->bufsize;
-		readyptr = sndbuf_getreadyptr(play_buf);
-		samples  = play_buf->buf;
-		written  = 0;
+		samples = play_buf->buf;
+		size    = play_buf->bufsize;
+		rp      = sndbuf_getreadyptr(play_buf);
+		count   = sndbuf_getready(play_buf);
+		written = 0;
 
 		/*
-		 * Write complete L/R pairs.  Check TXD once per pair to
-		 * avoid splitting a stereo frame across a FIFO-full boundary.
+		 * Fill the FIFO while it will accept writes (CS_A_TXD) and
+		 * the PCM buffer has at least one complete stereo frame (4 bytes).
 		 */
-		while (count >= 4) {
-			cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
-			if (!(cs & CS_A_TXD))
-				break;
-
-			val = (uint32_t)samples[readyptr % size] |
-			      ((uint32_t)samples[(readyptr + 1) % size] << 8);
+		while (count >= 4 &&
+		    (BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A) & CS_A_TXD)) {
+			/* CH1 – left sample, 16-bit LE in lower word bits */
+			val = (uint32_t)samples[rp % size] |
+			    ((uint32_t)samples[(rp + 1) % size] << 8);
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A, val);
-			readyptr += 2;
-
-			val = (uint32_t)samples[readyptr % size] |
-			      ((uint32_t)samples[(readyptr + 1) % size] << 8);
+			/* CH2 – right sample */
+			val = (uint32_t)samples[(rp + 2) % size] |
+			    ((uint32_t)samples[(rp + 3) % size] << 8);
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A, val);
-			readyptr += 2;
-
+			rp      = (rp + 4) % size;
 			written += 4;
 			count   -= 4;
 		}
 
-		sc->play_ptr += written;
-		sc->play_ptr %= size;
+		sc->play_ptr = (sc->play_ptr + written) % size;
 		ret |= AUDIO_DAI_PLAY_INTR;
 	}
 
-	if (intstc & INTx_A_RXR) {
-		uint8_t *samples;
-		uint32_t count, size, freeptr, recorded;
+	/*
+	 * RX: FIFO at or above the RXR threshold.  Drain in stereo-frame
+	 * pairs (CH1 then CH2) into the record buffer.
+	 */
+	if ((status & inten & INTx_A_RXR) && rec_buf != NULL) {
+		BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_RXR);
 
-		count    = sndbuf_getfree(rec_buf);
-		size     = rec_buf->bufsize;
-		freeptr  = sndbuf_getfreeptr(rec_buf);
-		samples  = rec_buf->buf;
-		recorded = 0;
+		samples = rec_buf->buf;
+		size    = rec_buf->bufsize;
+		rp      = sndbuf_getfreeptr(rec_buf);
+		count   = sndbuf_getfree(rec_buf);
+		written = 0;
 
-		while (count >= 4) {
-			cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
-			if (!(cs & CS_A_RXD))
-				break;
-
+		while (count >= 4 &&
+		    (BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A) & CS_A_RXD)) {
+			/* CH1 – left */
 			val = BCM2835_I2S_READ_4(sc, BCM_I2S_FIFO_A);
-			samples[freeptr++ % size] = val & 0xff;
-			samples[freeptr++ % size] = (val >> 8) & 0xff;
-
+			samples[rp % size]       = val & 0xff;
+			samples[(rp + 1) % size] = (val >> 8) & 0xff;
+			/* CH2 – right */
 			val = BCM2835_I2S_READ_4(sc, BCM_I2S_FIFO_A);
-			samples[freeptr++ % size] = val & 0xff;
-			samples[freeptr++ % size] = (val >> 8) & 0xff;
-
-			recorded += 4;
-			count    -= 4;
+			samples[(rp + 2) % size] = val & 0xff;
+			samples[(rp + 3) % size] = (val >> 8) & 0xff;
+			rp      = (rp + 4) % size;
+			written += 4;
+			count   -= 4;
 		}
 
-		sc->rec_ptr += recorded;
-		sc->rec_ptr %= size;
+		sc->rec_ptr = (sc->rec_ptr + written) % size;
 		ret |= AUDIO_DAI_REC_INTR;
 	}
 
-	BCM2835_I2S_UNLOCK(sc);
+	/* Clear any error latches that fired regardless of INTEN. */
+	if (status & (INTx_A_TXERR | INTx_A_RXERR))
+		BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A,
+		    status & (INTx_A_TXERR | INTx_A_RXERR));
 
+	BCM2835_I2S_UNLOCK(sc);
 	return (ret);
 }
 
@@ -448,12 +457,19 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
 			    cs | CS_A_EN | CS_A_TXON);
 		} else {
+			/*
+			 * Flush the RX FIFO before enabling reception.
+			 * RXCLR must not be set while RXON is set (BCM2835 §8.6),
+			 * so clear in a separate write.
+			 */
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
+			    cs | CS_A_EN | CS_A_RXCLR);
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_RXR);
 			inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
 			    inten | INTx_A_RXR);
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
-			    cs | CS_A_EN | CS_A_RXON | CS_A_RXCLR);
+			    cs | CS_A_EN | CS_A_RXON);
 		}
 		break;
 
@@ -499,7 +515,10 @@ bcm2835_i2s_dai_get_ptr(device_t dev, int pcm_dir)
 	sc = device_get_softc(dev);
 
 	BCM2835_I2S_LOCK(sc);
-	ptr = (pcm_dir == PCMDIR_PLAY) ? sc->play_ptr : sc->rec_ptr;
+	if (pcm_dir == PCMDIR_PLAY)
+		ptr = sc->play_ptr;
+	else
+		ptr = sc->rec_ptr;
 	BCM2835_I2S_UNLOCK(sc);
 
 	return (ptr);

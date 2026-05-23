@@ -71,6 +71,17 @@
 #define INTx_A_TXERR		(1u << 2) /* TX Fifo error occured */
 #define INTx_A_RXR		(1u << 1) /* RX Read interrupt occured */
 #define INTx_A_TXW		(1u << 0) /* TX Write interrupt occured */
+#define INTx_A_ALL		(INTx_A_RXERR | INTx_A_TXERR | INTx_A_RXR | INTx_A_TXW)
+
+/* DREQ_A — DMA request threshold levels (BCM2835 §8.8) */
+#define DREQ_A_TX_PANIC(n)	(((n) & 0x7fu) << 24)	/* TX panic threshold */
+#define DREQ_A_RX_PANIC(n)	(((n) & 0x7fu) << 16)	/* RX panic threshold */
+#define DREQ_A_TX(n)		(((n) & 0x7fu) << 8)	/* TX normal threshold */
+#define DREQ_A_RX(n)		(((n) & 0x7fu) << 0)	/* RX normal threshold */
+
+/* BCM2835 PCM/I2S peripheral DREQ assignments (ARM Peripherals Table 4-3) */
+#define BCM2835_I2S_DREQ_TX	2
+#define BCM2835_I2S_DREQ_RX	3
 
 /*
  * Fixed frame geometry: 2 × 32-bit slots = 64 BCLK per stereo frame.
@@ -87,14 +98,12 @@ struct bcm2835_i2s_softc {
 	device_t		 	clkman;	/* bcm2835_clkman device */
 	struct resource		*res[2];
 	struct mtx		 	mtx;
-	void				*intrhand;
-	uint32_t		 	play_ptr;
-	uint32_t		 	rec_ptr;
-	bool			 	hw_started; /* true once PCM clock is running (register accesses safe) */
-
-	int                 dma_chan_rx;   /* DMA channel in use, or -1 if none */
-	int                 dma_chan_tx;   /* DMA channel in use, or -1 if none */
-
+	void			*intrhand;
+	uint32_t		 play_ptr;	/* byte offset of current playback position */
+	uint32_t		 rec_ptr;	/* byte offset of current record position */
+	bool			 hw_started;	/* true once PCM clock is running */
+	int			 dma_chan_tx;	/* TX DMA channel (BCM_DMA_CH_INVALID if unallocated) */
+	int			 dma_chan_rx;	/* RX DMA channel (BCM_DMA_CH_INVALID if unallocated) */
 };
 
 #endif /* _BCM2835_I2S_H_ */
