@@ -48,12 +48,32 @@ static struct resource_spec bcm2835_i2s_spec[] = {
 	{ -1, 0 }
 };
 
-#define BCM2835_I2S_LOCK(sc)		mtx_lock(&(sc)->mtx)
-#define BCM2835_I2S_UNLOCK(sc)		mtx_unlock(&(sc)->mtx)
-#define BCM2835_I2S_READ_4(sc, reg)	\
-    bus_read_4((sc)->res[0], (reg))
-#define BCM2835_I2S_WRITE_4(sc, reg, val) \
-    bus_write_4((sc)->res[0], (reg), (val))
+#define BCM2835_I2S_LOCK(sc)				mtx_lock(&(sc)->mtx)
+#define BCM2835_I2S_UNLOCK(sc)				mtx_unlock(&(sc)->mtx)
+#define BCM2835_I2S_READ_4(sc, reg)			bus_read_4((sc)->res[0], (reg))
+#define BCM2835_I2S_WRITE_4(sc, reg, val) 	bus_write_4((sc)->res[0], (reg), (val))
+
+/*
+ * Wait for at least `cycles` PCM clocks using the CS_A SYNC echo mechanism.
+ * Each toggle-and-poll iteration consumes exactly 2 PCM clocks, so odd values
+ * are rounded up to the next even number.
+ */
+static void
+bcm2835_i2s_sync_wait(struct bcm2835_i2s_softc *sc, int cycles)
+{
+	uint32_t cs, target;
+	int i, n;
+
+	n = (cycles + 1) / 2;
+	for (i = 0; i < n; i++) {
+		cs     = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
+		target = (cs ^ CS_A_SYNC) & CS_A_SYNC;
+		BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, (cs & ~CS_A_SYNC) | target);
+		do {
+			cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
+		} while ((cs & CS_A_SYNC) != target);
+	}
+}
 
 static uint32_t sc_fmt[] = {
 	SND_FORMAT(AFMT_S16_LE, 2, 0),
@@ -109,6 +129,7 @@ bcm2835_i2s_attach(device_t dev)
 
 	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_DEF);
 
+	/* Allocate resources */
 	if (bus_alloc_resources(dev, bcm2835_i2s_spec, sc->res) != 0) {
 		device_printf(dev, "cannot allocate resources\n");
 		error = ENXIO;
@@ -123,22 +144,14 @@ bcm2835_i2s_attach(device_t dev)
 		goto fail;
 	}
 
-	/*
-	 * Start the PCM clock before touching any I2S registers.  Without a
-	 * running clock the APB bus stalls on the first register access,
-	 * producing a synchronous data abort on arm64.  hw_started is set
-	 * here so that detach knows register accesses are safe.
-	 *
-	 * Full block initialisation (MODE_A, TXC_A, RXC_A, EN/STBY) is
-	 * deferred to dai_init where the frame format is known, ensuring
-	 * those registers are written before the block is enabled.
-	 */
+	/* Set PCM clock to a default */
 	if (bcm2835_clkman_set_frequency(sc->clkman, BCM_PCM_CLKSRC,
 	    BCM2835_I2S_SAMPLING_RATE * BCM2835_I2S_FRAME_LEN) == 0) {
 		device_printf(dev, "cannot set PCM clock\n");
 		error = ENXIO;
 		goto fail;
 	}
+	
 	sc->hw_started = true;
 
 	node = ofw_bus_get_node(dev);
@@ -183,42 +196,42 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	flen = BCM2835_I2S_FRAME_LEN;
 
 	switch (fmt) {
-	case AUDIO_DAI_FORMAT_I2S:
-		/*
-		 * Standard I2S: FS high selects right channel.  Invert so
-		 * FS high selects left (CH1).  CH1 data begins one BCLK
-		 * after the FS edge per the BCM2835 convention.
-		 */
-		mode |= MODE_A_FSI;
-		fslen = flen / 2;
-		ch1pos = 1;
-		ch2pos = flen / 2 + 1;
-		break;
-	case AUDIO_DAI_FORMAT_LJ:
-		fslen = flen / 2;
-		ch1pos = 0;
-		ch2pos = flen / 2;
-		break;
-	case AUDIO_DAI_FORMAT_RJ:
-		fslen = flen / 2;
-		ch1pos = flen / 2 - BCM2835_I2S_CHWIDTH;
-		ch2pos = flen - BCM2835_I2S_CHWIDTH;
-		break;
-	case AUDIO_DAI_FORMAT_DSPA:
-		mode |= MODE_A_FSI;
-		flen  = 2 * BCM2835_I2S_CHWIDTH;
-		fslen = 1;
-		ch1pos = 1;
-		ch2pos = BCM2835_I2S_CHWIDTH + 1;
-		break;
-	case AUDIO_DAI_FORMAT_DSPB:
-		flen  = 2 * BCM2835_I2S_CHWIDTH;
-		fslen = 1;
-		ch1pos = 0;
-		ch2pos = BCM2835_I2S_CHWIDTH;
-		break;
-	default:
-		return (EINVAL);
+		case AUDIO_DAI_FORMAT_I2S:
+			/*
+			* Standard I2S: FS high selects right channel.  Invert so
+			* FS high selects left (CH1).  CH1 data begins one BCLK
+			* after the FS edge per the BCM2835 convention.
+			*/
+			mode |= MODE_A_FSI;
+			fslen = flen / 2;
+			ch1pos = 1;
+			ch2pos = flen / 2 + 1;
+			break;
+		case AUDIO_DAI_FORMAT_LJ:
+			fslen = flen / 2;
+			ch1pos = 0;
+			ch2pos = flen / 2;
+			break;
+		case AUDIO_DAI_FORMAT_RJ:
+			fslen = flen / 2;
+			ch1pos = flen / 2 - BCM2835_I2S_CHWIDTH;
+			ch2pos = flen - BCM2835_I2S_CHWIDTH;
+			break;
+		case AUDIO_DAI_FORMAT_DSPA:
+			mode |= MODE_A_FSI;
+			flen  = 2 * BCM2835_I2S_CHWIDTH;
+			fslen = 1;
+			ch1pos = 1;
+			ch2pos = BCM2835_I2S_CHWIDTH + 1;
+			break;
+		case AUDIO_DAI_FORMAT_DSPB:
+			flen  = 2 * BCM2835_I2S_CHWIDTH;
+			fslen = 1;
+			ch1pos = 0;
+			ch2pos = BCM2835_I2S_CHWIDTH;
+			break;
+		default:
+			return (EINVAL);
 	}
 
 	if (AUDIO_DAI_POLARITY_INVERTED_BCLK(pol))
@@ -228,41 +241,26 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 
 	mode |= MODE_A_FLEN(flen - 1) | MODE_A_FSLEN(fslen);
 
-	/*
-	 * BCM2835 ARM Peripherals §8.4 startup sequence:
-	 *  1. Disable the PCM block (EN=0) before writing mode/channel regs.
-	 *  2. Write MODE_A, TXC_A, RXC_A while the block is inactive.
-	 *  3. Release standby (STBY=1); wait ≥4 PCM clocks via SYNC.
-	 *  4. Enable the block (EN=1).
-	 *  5. Flush FIFOs, clear interrupt flags, set thresholds.
-	 */
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, 0);
 
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_MODE_A, mode);
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_EN); /* Enable PCM Block*/
+
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_MODE_A, mode); /* Set the mode */
 
 	chc = CHxC_CH1EN | CHxC_CH1POS(ch1pos) |
 	      CHxC_CH1WID(BCM2835_I2S_CHWIDTH - 8) |
 	      CHxC_CH2EN | CHxC_CH2POS(ch2pos) |
 	      CHxC_CH2WID(BCM2835_I2S_CHWIDTH - 8);
+
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_TXC_A, chc);
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_RXC_A, chc);
 
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_STBY);
-	DELAY(10); /* wait ≥4 PCM clocks (~3 MHz → ~1.3 µs) */
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_EN | CS_A_STBY);
-
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
-	    CS_A_EN | CS_A_STBY | CS_A_TXCLR | CS_A_RXCLR);
+	
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, 0);
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A,
-	    INTx_A_RXERR | INTx_A_TXERR | INTx_A_RXR | INTx_A_TXW);
-
-	/*
-	 * TXTHR=01: TXW fires when FIFO < 3/4 full (≥16 free slots).
-	 * RXTHR=01: RXR fires when FIFO ≥ 1/4 full (≥16 entries).
-	 */
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
-	    CS_A_EN | CS_A_STBY | CS_A_TXTHR(1) | CS_A_RXTHR(1));
+	    INTx_A_RXERR | 
+		INTx_A_TXERR | 
+		INTx_A_RXR | 
+		INTx_A_TXW);
 
 	return (0);
 }
@@ -279,9 +277,11 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 
 	BCM2835_I2S_LOCK(sc);
 
+	/* Read and clear the interrupt status */
 	intstc = BCM2835_I2S_READ_4(sc, BCM_I2S_INTSTC_A);
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, intstc);	/* W1C */
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, intstc);
 
+	/* If a TXW interrupt occurred*/
 	if (intstc & INTx_A_TXW) {
 		uint8_t *samples;
 		uint32_t count, size, readyptr, written;
@@ -373,74 +373,94 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 		return (EINVAL);
 
 	switch (go) {
-	case PCMTRIG_START:
-		cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
-		if (pcm_dir == PCMDIR_PLAY) {
-			/*
-			 * Clear the TX FIFO, then pre-fill it with silence.
-			 * TXCLR leaves the FIFO empty so TXW asserts and
-			 * latches into INTSTC_A immediately.  If we enable
-			 * INTEN_A with that latch set, the hardware interrupt
-			 * fires on another CPU core while chn_trigger() still
-			 * holds the channel lock, causing a mutex recursion
-			 * panic.  Filling the FIFO puts it above the TXW
-			 * threshold so the latch can be cleared before INTEN_A
-			 * is enabled, deferring the first interrupt until the
-			 * silence has been consumed and the lock is released.
-			 *
-			 * Always OR in CS_A_EN: PCMTRIG_STOP clears EN so
-			 * that the block is fully gated when idle, meaning cs
-			 * read back here may not have it set on the second and
-			 * subsequent plays.
-			 */
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
-			    cs | CS_A_EN | CS_A_TXCLR);
-			for (int i = 0; i < 64; i++)
-				BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A, 0);
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_TXW);
+		case PCMTRIG_START:
+			cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
+			if (pcm_dir == PCMDIR_PLAY) {
+				/*
+				* Clear the TX FIFO, then pre-fill it with silence.
+				* TXCLR leaves the FIFO empty so TXW asserts and
+				* latches into INTSTC_A immediately.  If we enable
+				* INTEN_A with that latch set, the hardware interrupt
+				* fires on another CPU core while chn_trigger() still
+				* holds the channel lock, causing a mutex recursion
+				* panic.  Filling the FIFO puts it above the TXW
+				* threshold so the latch can be cleared before INTEN_A
+				* is enabled, deferring the first interrupt until the
+				* silence has been consumed and the lock is released.
+				*
+				* Always OR in CS_A_EN: PCMTRIG_STOP clears EN so
+				* that the block is fully gated when idle, meaning cs
+				* read back here may not have it set on the second and
+				* subsequent plays.
+				*/
+				
+				/* Clear the TX FIFO */
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXCLR);
+				bcm2835_i2s_sync_wait(sc, 2); /* Wait for 2 PCM clocks */
+
+				/* Set interrupts to fire when FIFO level is lower than TXTHR level */
+				inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten | INTx_A_TXW);
+				
+				/* Silence Pre-fill */
+				for (int i = 0; i < 64; i++){
+					BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A, 0);
+				}
+
+				/* Clear the TXW interrupt status */
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_TXW);
+				
+				/*
+				* TODO: Replace this call with a call to a chanspeed() setter 
+				* TXTHR=01: TXW fires when FIFO less than full.
+				* RXTHR=01: RXR fires when FIFO is "at least full" (idek what that means).
+				*/
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXTHR(1) | CS_A_RXTHR(1));
+
+				/* Start transmission */
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXON);
+
+			} 
+			
+			else {
+
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_RXR);
+				
+				inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten | INTx_A_RXR);
+				
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
+					cs | CS_A_EN | CS_A_RXON | CS_A_RXCLR);
+			}
+			break;
+
+		case PCMTRIG_STOP:
+		case PCMTRIG_ABORT:
+			/* Stop PCM first; INTEN_A must not be written while running. */
+			cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
+			if (pcm_dir == PCMDIR_PLAY) {
+				cs &= ~CS_A_TXON;
+				cs |= CS_A_TXCLR;
+			} else {
+				cs &= ~CS_A_RXON;
+				cs |= CS_A_RXCLR;
+			}
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs);
+
 			inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
-			    inten | INTx_A_TXW);
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
-			    cs | CS_A_EN | CS_A_TXON);
-		} else {
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_RXR);
-			inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
-			    inten | INTx_A_RXR);
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
-			    cs | CS_A_EN | CS_A_RXON | CS_A_RXCLR);
-		}
-		break;
+			if (pcm_dir == PCMDIR_PLAY)
+				inten &= ~INTx_A_TXW;
+			else
+				inten &= ~INTx_A_RXR;
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten);
 
-	case PCMTRIG_STOP:
-	case PCMTRIG_ABORT:
-		inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
-		if (pcm_dir == PCMDIR_PLAY)
-			inten &= ~INTx_A_TXW;
-		else
-			inten &= ~INTx_A_RXR;
-		BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten);
-
-		cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
-		if (pcm_dir == PCMDIR_PLAY) {
-			cs &= ~CS_A_TXON;
-			cs |= CS_A_TXCLR;
-		} else {
-			cs &= ~CS_A_RXON;
-			cs |= CS_A_RXCLR;
-		}
-		if (!(cs & (CS_A_TXON | CS_A_RXON)))
-			cs &= ~CS_A_EN;
-		BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs);
-
-		BCM2835_I2S_LOCK(sc);
-		if (pcm_dir == PCMDIR_PLAY)
-			sc->play_ptr = 0;
-		else
-			sc->rec_ptr = 0;
-		BCM2835_I2S_UNLOCK(sc);
-		break;
+			BCM2835_I2S_LOCK(sc);
+			if (pcm_dir == PCMDIR_PLAY)
+				sc->play_ptr = 0;
+			else
+				sc->rec_ptr = 0;
+			BCM2835_I2S_UNLOCK(sc);
+			break;
 	}
 
 	return (0);
