@@ -49,6 +49,8 @@
 
 /* MODE_A */
 #define MODE_A_CLK_DIS		(1u << 28)	/* 1 = disable PCM clock */
+#define MODE_A_FRXP		(1u << 25)	/* RX packed mode: both channels in one FIFO word */
+#define MODE_A_FTXP		(1u << 24)	/* TX packed mode: one FIFO word fills both channels */
 #define MODE_A_CLKM		(1u << 23)	/* 1 = PCM_CLK slave (input) */
 #define MODE_A_CLKI		(1u << 22)	/* invert PCM_CLK */
 #define MODE_A_FSM		(1u << 21)	/* 1 = frame sync slave (input) */
@@ -73,14 +75,20 @@
 #define INTx_A_TXW		(1u << 0) /* TX Write interrupt occured */
 
 /*
- * Fixed frame geometry: 2 × 32-bit slots = 64 BCLK per stereo frame.
- * BCLK = sample_rate × 64.  Each FIFO word carries one 16-bit sample
- * (left or right), right-justified in a 32-bit word.
+ * Default frame geometry: 2 × ch_width BCLK per stereo frame (tight packing).
+ * BCLK = sample_rate × frame_len.  frame_len and ch_width are updated by
+ * set_chanformat when the PCM format changes.
+ *
+ * clkman divides a 500 MHz source by an integer, so the achieved BCLK
+ * may differ slightly from the requested value; set_chanspeed returns the
+ * actual achieved rate so feeder_rate can compensate.
  */
-#define BCM2835_I2S_FRAME_LEN		64
-#define BCM2835_I2S_CHWIDTH		16	/* bits per sample */
+#define BCM2835_I2S_FRAME_LEN		64	/* default: 2 × 32-bit slots */
+#define BCM2835_I2S_CHWIDTH		16	/* default bits per sample */
 #define BCM2835_I2S_FIFO_SIZE		64	/* 32-bit words */
-#define BCM2835_I2S_SAMPLING_RATE	48000
+#define BCM2835_I2S_RATE_MIN		8000
+#define BCM2835_I2S_RATE_DEFAULT	48000
+#define BCM2835_I2S_RATE_MAX		96000
 
 struct bcm2835_i2s_softc {
 	device_t		 dev;
@@ -90,6 +98,14 @@ struct bcm2835_i2s_softc {
 	void			*intrhand;
 	uint32_t		 play_ptr;
 	uint32_t		 rec_ptr;
+	uint32_t		 sample_rate;	/* current rate set by set_chanspeed */
+	uint32_t		 txthr;		/* CS_A_TXTHR value for current rate */
+	uint32_t		 rxthr;		/* CS_A_RXTHR value for current rate */
+	uint32_t		 frame_len;	/* BCLK per stereo frame (2 × ch_width) */
+	uint32_t		 ch_width;	/* hardware bits per sample */
+	uint32_t		 bytes_per_sample; /* PCM buffer bytes per sample */
+	int			 dai_fmt;	/* DAI format from dai_init (AUDIO_DAI_FORMAT_*) */
+	bool			 packed_mode;	/* true when FTXP/FRXP set: one FIFO word per stereo frame */
 	bool			 hw_started; /* true once PCM clock is running (register accesses safe) */
 };
 
