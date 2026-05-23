@@ -341,7 +341,9 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 		if (sc->packed_mode) {
 			/*
 			 * FTXP=1: one 32-bit FIFO word carries both channels.
-			 * L sample in [15:0], R sample in [31:16].
+			 * The BCM2835 shifts PCM bits MSB first, so channel 1
+			 * must occupy the upper half-word and channel 2 the lower
+			 * half-word to preserve left/right ordering on the wire.
 			 * Check TXD once per stereo frame.
 			 */
 			while (count >= (uint32_t)frame_bytes) {
@@ -350,10 +352,10 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 					break;
 
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A,
-				    bcm2835_i2s_pack_sample(samples,
-				        readyptr, size, bps) |
 				    (bcm2835_i2s_pack_sample(samples,
-				        readyptr + bps, size, bps) << 16));
+				        readyptr, size, bps) << 16) |
+				    bcm2835_i2s_pack_sample(samples,
+				        readyptr + bps, size, bps));
 				readyptr += frame_bytes;
 
 				written += frame_bytes;
@@ -407,7 +409,8 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 		if (sc->packed_mode) {
 			/*
 			 * FRXP=1: one 32-bit FIFO word carries both channels.
-			 * L sample in [15:0], R sample in [31:16].
+			 * Channel 1 is stored in the upper half-word and channel 2
+			 * in the lower half-word to match the MSB-first wire order.
 			 */
 			while (count >= (uint32_t)frame_bytes) {
 				cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
@@ -416,9 +419,9 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 
 				val = BCM2835_I2S_READ_4(sc, BCM_I2S_FIFO_A);
 				bcm2835_i2s_unpack_sample(samples, freeptr,
-				    size, val, bps);               /* L */
+				    size, val >> 16, bps);         /* L */
 				bcm2835_i2s_unpack_sample(samples, freeptr + bps,
-				    size, val >> 16, bps);         /* R */
+				    size, val, bps);               /* R */
 				freeptr += frame_bytes;
 
 				recorded += frame_bytes;
