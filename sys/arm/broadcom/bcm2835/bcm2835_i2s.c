@@ -129,6 +129,7 @@ bcm2835_i2s_attach(device_t dev)
 
 	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_DEF);
 
+	/* Allocate resources */
 	if (bus_alloc_resources(dev, bcm2835_i2s_spec, sc->res) != 0) {
 		device_printf(dev, "cannot allocate resources\n");
 		error = ENXIO;
@@ -143,12 +144,14 @@ bcm2835_i2s_attach(device_t dev)
 		goto fail;
 	}
 
+	/* Set PCM clock to a default */
 	if (bcm2835_clkman_set_frequency(sc->clkman, BCM_PCM_CLKSRC,
 	    BCM2835_I2S_SAMPLING_RATE * BCM2835_I2S_FRAME_LEN) == 0) {
 		device_printf(dev, "cannot set PCM clock\n");
 		error = ENXIO;
 		goto fail;
 	}
+	
 	sc->hw_started = true;
 
 	node = ofw_bus_get_node(dev);
@@ -239,7 +242,7 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	mode |= MODE_A_FLEN(flen - 1) | MODE_A_FSLEN(fslen);
 
 
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, 0); /* Disable PCM Block*/
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_EN); /* Enable PCM Block*/
 
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_MODE_A, mode); /* Set the mode */
 
@@ -251,8 +254,6 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_TXC_A, chc);
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_RXC_A, chc);
 
-
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_TXCLR | CS_A_RXCLR); /* Clear FIFOs */
 	
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, 0);
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A,
@@ -260,13 +261,6 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 		INTx_A_TXERR | 
 		INTx_A_RXR | 
 		INTx_A_TXW);
-
-	/*
-	 * TXTHR=01: TXW fires when FIFO < 3/4 full (≥16 free slots).
-	 * RXTHR=01: RXR fires when FIFO ≥ 1/4 full (≥16 entries).
-	 */
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
-	    CS_A_EN | CS_A_STBY | CS_A_TXTHR(1) | CS_A_RXTHR(1));
 
 	return (0);
 }
@@ -283,9 +277,11 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 
 	BCM2835_I2S_LOCK(sc);
 
+	/* Read and clear the interrupt status */
 	intstc = BCM2835_I2S_READ_4(sc, BCM_I2S_INTSTC_A);
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, intstc);	/* W1C */
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, intstc);
 
+	/* If a TXW interrupt occurred*/
 	if (intstc & INTx_A_TXW) {
 		uint8_t *samples;
 		uint32_t count, size, readyptr, written;
@@ -397,32 +393,42 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 				* read back here may not have it set on the second and
 				* subsequent plays.
 				*/
+				
+				/* Clear the TX FIFO */
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXCLR);
+				bcm2835_i2s_sync_wait(sc, 2); /* Wait for 2 PCM clocks */
 
-				/* Set the resons for generating an interrupt */
+				/* Set interrupts to fire when FIFO level is lower than TXTHR level */
 				inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten | INTx_A_TXW);
-				
-				/* Enable the PCM Block, clear the TX FIFO */
-				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_EN | CS_A_TXCLR);
 				
 				/* Silence Pre-fill */
 				for (int i = 0; i < 64; i++){
 					BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A, 0);
 				}
 
+				/* Clear the TXW interrupt status */
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_TXW);
 				
+				/*
+				* TODO: Replace this call with a call to a chanspeed() setter 
+				* TXTHR=01: TXW fires when FIFO less than full.
+				* RXTHR=01: RXR fires when FIFO is "at least full" (idek what that means).
+				*/
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXTHR(1) | CS_A_RXTHR(1));
 
-				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_EN | CS_A_TXON);
+				/* Start transmission */
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXON);
 
 			} 
 			
 			else {
 
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_RXR);
+				
 				inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
-				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
-					inten | INTx_A_RXR);
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten | INTx_A_RXR);
+				
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
 					cs | CS_A_EN | CS_A_RXON | CS_A_RXCLR);
 			}
@@ -430,13 +436,7 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 
 		case PCMTRIG_STOP:
 		case PCMTRIG_ABORT:
-			inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
-			if (pcm_dir == PCMDIR_PLAY)
-				inten &= ~INTx_A_TXW;
-			else
-				inten &= ~INTx_A_RXR;
-			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten);
-
+			/* Stop PCM first; INTEN_A must not be written while running. */
 			cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
 			if (pcm_dir == PCMDIR_PLAY) {
 				cs &= ~CS_A_TXON;
@@ -445,9 +445,14 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 				cs &= ~CS_A_RXON;
 				cs |= CS_A_RXCLR;
 			}
-			if (!(cs & (CS_A_TXON | CS_A_RXON)))
-				cs &= ~CS_A_EN;
 			BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs);
+
+			inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
+			if (pcm_dir == PCMDIR_PLAY)
+				inten &= ~INTx_A_TXW;
+			else
+				inten &= ~INTx_A_RXR;
+			BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten);
 
 			BCM2835_I2S_LOCK(sc);
 			if (pcm_dir == PCMDIR_PLAY)
