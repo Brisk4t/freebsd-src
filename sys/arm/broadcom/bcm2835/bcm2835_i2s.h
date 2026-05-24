@@ -94,8 +94,8 @@
  * may differ slightly from the requested value; set_chanspeed returns the
  * actual achieved rate so feeder_rate can compensate.
  */
-#define BCM2835_I2S_FRAME_LEN		64	/* default: 2 × 32-bit slots */
-#define BCM2835_I2S_CHWIDTH		16	/* default bits per sample */
+#define BCM2835_I2S_FRAME_LEN		32	/* default: 2 × 32-bit slots */
+#define BCM2835_I2S_CHWIDTH			16	/* default bits per sample */
 #define BCM2835_I2S_FIFO_SIZE		64	/* 32-bit words */
 #define BCM2835_I2S_RATE_MIN		8000
 #define BCM2835_I2S_RATE_DEFAULT	48000

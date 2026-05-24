@@ -183,6 +183,7 @@ bcm2835_i2s_attach(device_t dev)
 		error = ENXIO;
 		goto fail;
 	}
+
 	sc->sample_rate    = BCM2835_I2S_RATE_DEFAULT;
 	sc->txthr          = 2;
 	sc->rxthr          = 1;
@@ -204,7 +205,7 @@ fail:
 	return (error);
 }
 
-
+// Runs first
 static int
 bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 {
@@ -218,6 +219,8 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	fmt = AUDIO_DAI_FORMAT_FORMAT(format);
 	pol = AUDIO_DAI_FORMAT_POLARITY(format);
 	clk = AUDIO_DAI_FORMAT_CLOCK(format);
+
+	device_printf(dev, "DAI init: format=%#x\n", format);
 
 	mode = 0;
 
@@ -465,6 +468,7 @@ bcm2835_i2s_dai_get_caps(device_t dev)
 	return (&bcm2835_i2s_caps);
 }
 
+
 static int
 bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 {
@@ -478,36 +482,47 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 		case PCMTRIG_START:
 			cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
 			if (pcm_dir == PCMDIR_PLAY) {
-				
-				/* Clear the TX FIFO */
-				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXCLR);
-				bcm2835_i2s_sync_wait(sc, 2); /* Wait for 2 PCM clocks */
-
-				/* Set interrupts to fire when FIFO level is lower than TXTHR level */
-				inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
-				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten | INTx_A_TXW);
-				
-				/* Silence Pre-fill */
-				for (int i = 0; i < 64; i++){
-					BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A, 0);
+				if (cs & CS_A_TXON) {
+					/*
+					 * Already transmitting: the PCM layer re-triggers
+					 * after each ISR callback.  Just keep the interrupt
+					 * armed and return — do NOT clear the FIFO or
+					 * re-prefill with silence, which would glitch audio.
+					 */
+					inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
+					BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
+					    inten | INTx_A_TXW);
+					break;
 				}
 
-				/* Clear the TXW interrupt status */
+				/* First start: clear FIFO, prefill silence, then enable TX. */
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXCLR);
+				bcm2835_i2s_sync_wait(sc, 2);
+
+				inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
+				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten | INTx_A_TXW);
+
+				for (int i = 0; i < 64; i++)
+					BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A, 0);
+
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_TXW);
 
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
 				    cs | CS_A_TXON |
 				    CS_A_TXTHR(sc->txthr) | CS_A_RXTHR(sc->rxthr));
-
-			} 
-			
-			else {
+			} else {
+				if (cs & CS_A_RXON) {
+					inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
+					BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A,
+					    inten | INTx_A_RXR);
+					break;
+				}
 
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_RXR);
-				
+
 				inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, inten | INTx_A_RXR);
-				
+
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
 				    cs | CS_A_EN | CS_A_RXON | CS_A_RXCLR |
 				    CS_A_RXTHR(sc->rxthr));
@@ -577,6 +592,7 @@ bcm2835_i2s_dai_setup_intr(device_t dev, driver_intr_t intr_handler,
 	return (0);
 }
 
+// Runs 3rd after init (2nd in loop)
 static uint32_t
 bcm2835_i2s_dai_set_chanformat(device_t dev, uint32_t format)
 {
@@ -587,27 +603,12 @@ bcm2835_i2s_dai_set_chanformat(device_t dev, uint32_t format)
 
 	sc = device_get_softc(dev);
 
-	ch_width = AFMT_BIT(format);
-	bps      = AFMT_BPS(format);
+	device_printf(dev, "Set chanformat: format=%u\n", format);
 
-	/*
-	 * Frame = 2 × ch_width BCLK (tight packing: one slot per channel,
-	 * slot width equals sample width).  This minimises BCLK frequency and
-	 * allows feeder_rate to return an accurate achieved sample rate.
-	 */
+	ch_width = AFMT_BIT(format); // For example, AFMT_S16_LE → 16, AFMT_S32_LE → 32
+	bps      = AFMT_BPS(format); // For example, AFMT_S16_LE → 2, AFMT_S32_LE → 4
+
 	frame_len = 2 * ch_width;
-
-	/*
-	 * Channel width register encoding:
-	 *   WEX=0 → actual width = WID + 8   (covers  8–23 bit)
-	 *   WEX=1 → actual width = WID + 24  (covers 24–39 bit)
-	 * CHxC_CH1WID(n) stores n = width – 8 masked to 4 bits, which
-	 * naturally gives the correct WID value in both cases:
-	 *   16-bit: (16-8)=8  & 0xf = 8,  WEX=0 → 8+8=16  ✓
-	 *   32-bit: (32-8)=24 & 0xf = 8,  WEX=1 → 8+24=32 ✓
-	 *   24-bit: (24-8)=16 & 0xf = 0,  WEX=1 → 0+24=24 ✓
-	 *    8-bit: (8-8) =0  & 0xf = 0,  WEX=0 → 0+8=8   ✓
-	 */
 	wid = ch_width - 8;
 	wex = (ch_width > 23);
 
@@ -656,11 +657,15 @@ bcm2835_i2s_dai_set_chanformat(device_t dev, uint32_t format)
 	 * the clock and polarity bits (CLKM, CLKI, FSM, FSI, CLK_DIS).
 	 */
 	mode = BCM2835_I2S_READ_4(sc, BCM_I2S_MODE_A);
-	mode &= ~(MODE_A_FLEN(0x3ff) | MODE_A_FSLEN(0x3ff) |
-	    MODE_A_FTXP | MODE_A_FRXP);
+	
+	mode &= ~(MODE_A_FLEN(0x3ff) | MODE_A_FSLEN(0x3ff) | MODE_A_FTXP | MODE_A_FRXP);
+	
 	mode |= MODE_A_FLEN(frame_len - 1) | MODE_A_FSLEN(fslen);
-	if (packed)
+	
+	if (packed){
 		mode |= MODE_A_FTXP | MODE_A_FRXP;
+	}
+
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_MODE_A, mode);
 
 	chc = (wex ? CHxC_CH1WEX : 0) |
@@ -681,25 +686,19 @@ bcm2835_i2s_dai_set_chanformat(device_t dev, uint32_t format)
 	return (0);
 }
 
+// Never called
 static int
 bcm2835_i2s_dai_set_sysclk(device_t dev, unsigned int rate, int dai_dir)
 {
-	struct bcm2835_i2s_softc *sc;
-
-	sc = device_get_softc(dev);
-	if (sc->clkman == NULL)
-		return (ENXIO);
-
-	if (bcm2835_clkman_set_frequency(sc->clkman, BCM_PCM_CLKSRC,
-	    rate) == 0) {
-		device_printf(sc->dev, "could not set PCM clock to %u Hz\n",
-		    rate);
-		return (EIO);
-	}
+	device_printf(dev, "Set sysclk: rate=%u, dir=%d\n", rate, dai_dir);
+	(void)dev;
+	(void)rate;
+	(void)dai_dir;
 
 	return (0);
 }
 
+// Runs 2nd after init (1st in loop)
 static uint32_t
 bcm2835_i2s_dai_set_chanspeed(device_t dev, uint32_t speed)
 {
@@ -709,6 +708,9 @@ bcm2835_i2s_dai_set_chanspeed(device_t dev, uint32_t speed)
 	sc = device_get_softc(dev);
 	if (sc->clkman == NULL)
 		return (speed);
+
+
+	device_printf(dev, "Set chanspeed: speed=%u\n, packed=%d\n", speed, sc->packed_mode);
 
 	/*
 	 * TXTHR=1: TXW fires when TX FIFO < 3/4 full (16 words free, ~1ms at 8kHz).
@@ -727,13 +729,14 @@ bcm2835_i2s_dai_set_chanspeed(device_t dev, uint32_t speed)
 		return (speed);
 	}
 
-	actual_bclk = bcm2835_clkman_set_frequency(sc->clkman, BCM_PCM_CLKSRC,
-	    speed * sc->frame_len);
+	actual_bclk = bcm2835_clkman_set_frequency(sc->clkman, BCM_PCM_CLKSRC, speed * sc->frame_len);
 	if (actual_bclk == 0) {
 		device_printf(sc->dev, "could not set PCM clock for %u Hz\n",
 		    speed);
 		return (speed);
 	}
+	device_printf(sc->dev, "PCM clock set to %u Hz for requested rate %u Hz\n when frame length is %u\n",
+	    actual_bclk, speed, sc->frame_len);
 
 	/*
 	 * Return the actual achieved rate so the PCM layer can insert
