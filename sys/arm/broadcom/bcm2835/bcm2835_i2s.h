@@ -90,9 +90,11 @@
  * BCLK = sample_rate × frame_len.  frame_len and ch_width are updated by
  * set_chanformat when the PCM format changes.
  *
- * clkman divides a 500 MHz source by an integer, so the achieved BCLK
- * may differ slightly from the requested value; set_chanspeed returns the
- * actual achieved rate so feeder_rate can compensate.
+ * clkman divides the PLLD VCO by an integer divisor; the VCO frequency is
+ * read from hardware at attach (500 MHz on BCM2835, ~750 MHz on BCM2711).
+ * The achieved BCLK may differ slightly from the requested value due to
+ * integer rounding; set_chanspeed returns the actual achieved rate so
+ * feeder_rate can compensate.
  */
 #define BCM2835_I2S_FRAME_LEN		32	/* default: 2 × 32-bit slots */
 #define BCM2835_I2S_CHWIDTH			16	/* default bits per sample */
