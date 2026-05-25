@@ -47,19 +47,14 @@
 
 #include <arm/broadcom/bcm2835/bcm2835_clkman.h>
 
-static struct ofw_compat_data compat_data[] = {
-	{"brcm,bcm2711-cprman",		1},
-	{"brcm,bcm2835-cprman",		1},
-	{"broadcom,bcm2835-cprman",	1},
-	{NULL,				0}
-};
-
 struct bcm2835_clkman_softc {
 	device_t		sc_dev;
 
 	struct resource *	sc_m_res;
 	bus_space_tag_t		sc_m_bst;
 	bus_space_handle_t	sc_m_bsh;
+
+	uint32_t		sc_plld_freq;
 };
 
 #define BCM_CLKMAN_WRITE(_sc, _off, _val)              \
@@ -71,6 +66,14 @@ struct bcm2835_clkman_softc {
 #define R_CMCLK(_sc, unit) BCM_CLKMAN_READ(_sc, unit)
 #define W_CMDIV(_sc, unit, _val) BCM_CLKMAN_WRITE(_sc, (unit) + 4, 0x5a000000 | (_val))
 #define R_CMDIV(_sc,  unit) BCM_CLKMAN_READ(_sc, (unit) + 4)
+
+/* ocd_data holds PLLD_per in Hz: 750 MHz for BCM2711, 500 MHz for BCM2835. */
+static struct ofw_compat_data compat_data[] = {
+	{"brcm,bcm2711-cprman",		750000000},
+	{"brcm,bcm2835-cprman",		500000000},
+	{"broadcom,bcm2835-cprman",	500000000},
+	{NULL,				0}
+};
 
 static int
 bcm2835_clkman_probe(device_t dev)
@@ -101,6 +104,9 @@ bcm2835_clkman_attach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->sc_dev = dev;
 
+	sc->sc_plld_freq = (uint32_t)
+	    ofw_bus_search_compatible(dev, compat_data)->ocd_data;
+
 	rid = 0;
 	sc->sc_m_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
 	    RF_ACTIVE);
@@ -111,6 +117,13 @@ bcm2835_clkman_attach(device_t dev)
 
 	sc->sc_m_bst = rman_get_bustag(sc->sc_m_res);
 	sc->sc_m_bsh = rman_get_bushandle(sc->sc_m_res);
+
+	device_printf(dev, "PLLD_per frequency: %u Hz\n", sc->sc_plld_freq);
+
+	SYSCTL_ADD_UINT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
+	    OID_AUTO, "plld_freq", CTLFLAG_RD, &sc->sc_plld_freq, 0,
+	    "PLLD_per source frequency in Hz");
 
 	bus_attach_children(dev);
 	return (0);
@@ -146,20 +159,20 @@ bcm2835_clkman_set_frequency(device_t dev, uint32_t unit, uint32_t hz)
 	if (hz == 0)
 		return (0);
 
-	u = 500000000/hz;
+	u = sc->sc_plld_freq / hz;
 	if (u < 4) {
 		device_printf(sc->sc_dev,
-		    "Frequency too high for unit 0x%x (max: 125 MHz)",
-		    unit);
+		    "Frequency too high for unit 0x%x (max: %u MHz)",
+		    unit, sc->sc_plld_freq / 4 / 1000000);
 		return (0);
 	}
 	if (u > 0xfff) {
 		device_printf(sc->sc_dev,
-		    "Frequency too low for unit 0x%x (min: 123 kHz)",
-		    unit);
+		    "Frequency too low for unit 0x%x (min: %u kHz)",
+		    unit, sc->sc_plld_freq / 0xfff / 1000);
 		return (0);
 	}
-	hz = 500000000/u;
+	hz = sc->sc_plld_freq / u;
 	W_CMDIV(sc, unit, u << 12);
 
 	W_CMCLK(sc, unit, 0x16);

@@ -323,7 +323,7 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 
 	BCM2835_I2S_LOCK(sc);
 
-	/* Read and clear the interrupt status */
+	/* Read and clear the interrupt status */ 
 	intstc = BCM2835_I2S_READ_4(sc, BCM_I2S_INTSTC_A);
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, intstc);
 
@@ -345,8 +345,8 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 			/*
 			 * FTXP=1: one 32-bit FIFO word carries both channels.
 			 * The BCM2835 shifts PCM bits MSB first, so channel 1
-			 * must occupy the upper half-word and channel 2 the lower
-			 * half-word to preserve left/right ordering on the wire.
+			 * occupies the lower half-word and channel 2 the upper
+			 * half-word per the FIFO packing rules.
 			 * Check TXD once per stereo frame.
 			 */
 			while (count >= (uint32_t)frame_bytes) {
@@ -355,10 +355,10 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 					break;
 
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A,
-				    (bcm2835_i2s_pack_sample(samples,
-				        readyptr, size, bps) << 16) |
 				    bcm2835_i2s_pack_sample(samples,
-				        readyptr + bps, size, bps));
+				        readyptr, size, bps) |
+				    (bcm2835_i2s_pack_sample(samples,
+				        readyptr + bps, size, bps) << 16));
 				readyptr += frame_bytes;
 
 				written += frame_bytes;
@@ -412,8 +412,8 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 		if (sc->packed_mode) {
 			/*
 			 * FRXP=1: one 32-bit FIFO word carries both channels.
-			 * Channel 1 is stored in the upper half-word and channel 2
-			 * in the lower half-word to match the MSB-first wire order.
+			 * Channel 1 is stored in the lower half-word and channel 2
+			 * in the upper half-word per the FIFO packing rules.
 			 */
 			while (count >= (uint32_t)frame_bytes) {
 				cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
@@ -422,9 +422,9 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 
 				val = BCM2835_I2S_READ_4(sc, BCM_I2S_FIFO_A);
 				bcm2835_i2s_unpack_sample(samples, freeptr,
-				    size, val >> 16, bps);         /* L */
+				    size, val, bps);               /* L */
 				bcm2835_i2s_unpack_sample(samples, freeptr + bps,
-				    size, val, bps);               /* R */
+				    size, val >> 16, bps);         /* R */
 				freeptr += frame_bytes;
 
 				recorded += frame_bytes;
