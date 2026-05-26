@@ -67,10 +67,11 @@ struct bcm2835_clkman_softc {
 #define W_CMDIV(_sc, unit, _val) BCM_CLKMAN_WRITE(_sc, (unit) + 4, 0x5a000000 | (_val))
 #define R_CMDIV(_sc,  unit) BCM_CLKMAN_READ(_sc, (unit) + 4)
 
+/* ocd_data holds PLLD_per in Hz: 750 MHz for BCM2711, 500 MHz for BCM2835. */
 static struct ofw_compat_data compat_data[] = {
-	{"brcm,bcm2711-cprman",		(uintptr_t)&bcm2711_soc_data},
-	{"brcm,bcm2835-cprman",		(uintptr_t)&bcm2835_soc_data},
-	{"broadcom,bcm2835-cprman",	(uintptr_t)&bcm2835_soc_data},
+	{"brcm,bcm2711-cprman",		750000000},
+	{"brcm,bcm2835-cprman",		500000000},
+	{"broadcom,bcm2835-cprman",	500000000},
 	{NULL,				0}
 };
 
@@ -93,7 +94,6 @@ static int
 bcm2835_clkman_attach(device_t dev)
 {
 	struct bcm2835_clkman_softc *sc;
-	const struct bcm2835_clkman_soc_data *soc;
 	int rid;
 
 	if (device_get_unit(dev) != 0) {
@@ -104,9 +104,8 @@ bcm2835_clkman_attach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->sc_dev = dev;
 
-	soc = (const struct bcm2835_clkman_soc_data *)
+	sc->sc_plld_freq = (uint32_t)
 	    ofw_bus_search_compatible(dev, compat_data)->ocd_data;
-	sc->sc_plld_freq = soc->plld_freq;
 
 	rid = 0;
 	sc->sc_m_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
@@ -124,7 +123,7 @@ bcm2835_clkman_attach(device_t dev)
 	SYSCTL_ADD_UINT(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
 	    OID_AUTO, "plld_freq", CTLFLAG_RD, &sc->sc_plld_freq, 0,
-	    "PLLD_per source frequency in Hz (queried from firmware at attach)");
+	    "PLLD_per source frequency in Hz");
 
 	bus_attach_children(dev);
 	return (0);
@@ -222,4 +221,3 @@ static driver_t bcm2835_clkman_driver = {
 
 DRIVER_MODULE(bcm2835_clkman, simplebus, bcm2835_clkman_driver, 0, 0);
 MODULE_VERSION(bcm2835_clkman, 1);
-MODULE_DEPEND(bcm2835_clkman, bcm2835_firmware, 1, 1, 1);
