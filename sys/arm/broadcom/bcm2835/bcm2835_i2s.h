@@ -90,18 +90,16 @@
  * BCLK = sample_rate × frame_len.  frame_len and ch_width are updated by
  * set_chanformat when the PCM format changes.
  *
- * clkman divides the PLLD VCO by an integer divisor; the VCO frequency is
- * read from hardware at attach (500 MHz on BCM2835, ~750 MHz on BCM2711).
- * The achieved BCLK may differ slightly from the requested value due to
- * integer rounding; set_chanspeed returns the actual achieved rate so
- * feeder_rate can compensate.
+ * BCM2835 PLLD VCO ≈ 500 MHz; BCM2711 PLLD VCO ≈ 750 MHz.
+ * Integer clock division limits achievable rates; set_chanspeed returns the
+ * actual achieved rate so feeder_rate can compensate.
  */
-#define BCM2835_I2S_FRAME_LEN		32	/* default: 2 × 32-bit slots */
-#define BCM2835_I2S_CHWIDTH			16	/* default bits per sample */
+#define BCM2835_I2S_FRAME_LEN		32	/* default: 2 × 16-bit slots */
+#define BCM2835_I2S_CHWIDTH		16	/* default bits per sample */
 #define BCM2835_I2S_FIFO_SIZE		64	/* 32-bit words */
 #define BCM2835_I2S_RATE_MIN		8000
 #define BCM2835_I2S_RATE_DEFAULT	48000
-#define BCM2835_I2S_RATE_MAX		96000
+#define BCM2835_I2S_RATE_MAX		192000	/* BCM2711 sustains 192 kHz */
 
 struct bcm2835_i2s_softc {
 	device_t		 dev;
@@ -117,11 +115,12 @@ struct bcm2835_i2s_softc {
 	uint32_t		 frame_len;	/* BCLK per stereo frame (2 × ch_width) */
 	uint32_t		 ch_width;	/* hardware bits per sample */
 	uint32_t		 bytes_per_sample; /* PCM buffer bytes per sample */
-	int			 dai_fmt;	/* DAI format from dai_init (AUDIO_DAI_FORMAT_*) */
-	bool			 packed_mode;	/* true when FTXP/FRXP set: one FIFO word per stereo frame */
-	bool			 hw_started; /* true once PCM clock is running (register accesses safe) */
-	int			 dma_chan_tx; /* TX DMA channel (BCM_DMA_CH_INVALID if unallocated) */
-	int			 dma_chan_rx; /* RX DMA channel (BCM_DMA_CH_INVALID if unallocated) */
+	uint32_t		 num_channels;	/* 1 = mono, 2 = stereo */
+	int			 	dai_fmt;	/* DAI format from dai_init (AUDIO_DAI_FORMAT_*) */
+	bool			 packed_mode;	/* true when FTXP/FRXP: one FIFO word per stereo frame */
+	bool			 hw_started;	/* true once PCM clock is running */
+	int			 dma_chan_tx;	/* TX DMA channel (BCM_DMA_CH_INVALID if unallocated) */
+	int			 dma_chan_rx;	/* RX DMA channel (BCM_DMA_CH_INVALID if unallocated) */
 };
 
 #endif /* _BCM2835_I2S_H_ */

@@ -1,18 +1,30 @@
-/*-
- * SPDX-License-Identifier: BSD-2-Clause
+/*
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Copyright (c) 2024 Brisk4t	
+ * Copyright (c) 2026 Brisk4t
  *
- * BCM2835 I2S/PCM audio DAI driver for FreeBSD.
- * Based on rk_i2s.c by Oleksandr Tymoshenko <gonzo@FreeBSD.org>
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the author nor the names of its contributors may
+ *    be used to endorse or promote products derived from this software
  *
- * The bcm2835 DTS node does not carry an interrupt specifier by default.
- * A DTS overlay must add one before this driver can be used:
- *
- *   &i2s { interrupts = <0 119 4>; };  -- GIC SPI 119 (GPU IRQ 55, bank2 bit23 + 96)
- *
- * Clock management is delegated to bcm2835_clkman, which must be loaded
- * first (MODULE_DEPEND enforces this).
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  */
 
 #include <sys/param.h>
@@ -32,13 +44,14 @@
 #include "opt_snd.h"
 #include <dev/sound/pcm/sound.h>
 #include <dev/sound/fdt/audio_dai.h>
+#include <arm/broadcom/bcm2835/bcm2835_clkman.h>
 #include "audio_dai_if.h"
 
-#include <arm/broadcom/bcm2835/bcm2835_clkman.h>
 #include "bcm2835_i2s.h"
 
 static struct ofw_compat_data compat_data[] = {
 	{ "brcm,bcm2835-i2s",	1 },
+	{ "brcm,bcm2711-i2s",	1 },
 	{ NULL,			0 }
 };
 
@@ -76,8 +89,13 @@ bcm2835_i2s_sync_wait(struct bcm2835_i2s_softc *sc, int cycles)
 }
 
 static uint32_t sc_fmt[] = {
+	SND_FORMAT(AFMT_S8,     1, 0),
 	SND_FORMAT(AFMT_S8,     2, 0),
+	SND_FORMAT(AFMT_S16_LE, 1, 0),
 	SND_FORMAT(AFMT_S16_LE, 2, 0),
+	SND_FORMAT(AFMT_S24_LE, 1, 0),
+	SND_FORMAT(AFMT_S24_LE, 2, 0),
+	SND_FORMAT(AFMT_S32_LE, 1, 0),
 	SND_FORMAT(AFMT_S32_LE, 2, 0),
 	0
 };
@@ -184,15 +202,17 @@ bcm2835_i2s_attach(device_t dev)
 		goto fail;
 	}
 
-	sc->sample_rate    = BCM2835_I2S_RATE_DEFAULT;
-	sc->txthr          = 2;
-	sc->rxthr          = 1;
-	sc->frame_len      = BCM2835_I2S_FRAME_LEN;
-	sc->ch_width       = BCM2835_I2S_CHWIDTH;
+	sc->sample_rate      = BCM2835_I2S_RATE_DEFAULT;
+	sc->txthr            = 2;
+	sc->rxthr            = 1;
+	sc->frame_len        = BCM2835_I2S_FRAME_LEN;
+	sc->ch_width         = BCM2835_I2S_CHWIDTH;
 	sc->bytes_per_sample = BCM2835_I2S_CHWIDTH / 8;
-	sc->dai_fmt        = AUDIO_DAI_FORMAT_I2S;
-	sc->packed_mode    = (BCM2835_I2S_CHWIDTH <= 16);
+	sc->num_channels     = 2;
+	sc->dai_fmt          = AUDIO_DAI_FORMAT_I2S;
+	sc->packed_mode      = (BCM2835_I2S_CHWIDTH <= 16);
 
+	/* Cleanly detach */
 	sc->hw_started = true;
 
 	node = ofw_bus_get_node(dev);
@@ -205,7 +225,6 @@ fail:
 	return (error);
 }
 
-// Runs first
 static int
 bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 {
@@ -220,20 +239,22 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	pol = AUDIO_DAI_FORMAT_POLARITY(format);
 	clk = AUDIO_DAI_FORMAT_CLOCK(format);
 
-	device_printf(dev, "DAI init: format=%#x\n", format);
-
 	mode = 0;
 
 	switch (clk) {
-	case AUDIO_DAI_CLOCK_CBM_CFM:
-		/* BCM2835 drives BCLK and LRCLK (master mode). */
-		break;
-	case AUDIO_DAI_CLOCK_CBS_CFS:
-		/* Codec drives BCLK and LRCLK; BCM2835 is clock slave. */
-		mode |= MODE_A_CLKM | MODE_A_FSM;
-		break;
-	default:
-		return (EINVAL);
+		case AUDIO_DAI_CLOCK_CBM_CFM:
+			break;
+		case AUDIO_DAI_CLOCK_CBS_CFM:
+			mode |= MODE_A_CLKM;
+			break;
+		case AUDIO_DAI_CLOCK_CBM_CFS:
+			mode |= MODE_A_FSM;
+			break;
+		case AUDIO_DAI_CLOCK_CBS_CFS:
+			mode |= MODE_A_CLKM | MODE_A_FSM;
+			break;
+		default:
+			return (EINVAL);
 	}
 
 	/*
@@ -244,41 +265,49 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	flen = 2 * sc->ch_width;
 
 	switch (fmt) {
-		case AUDIO_DAI_FORMAT_I2S:
-			/*
-			 * Standard I2S: FS high selects right channel.  Invert so
-			 * FS high selects left (CH1).  CH1 data begins one BCLK
-			 * after the FS edge per the BCM2835 convention.
-			 */
-			mode |= MODE_A_FSI;
-			fslen  = sc->ch_width;
-			ch1pos = 1;
-			ch2pos = sc->ch_width + 1;
-			break;
-		case AUDIO_DAI_FORMAT_LJ:
-			fslen  = sc->ch_width;
-			ch1pos = 0;
-			ch2pos = sc->ch_width;
-			break;
-		case AUDIO_DAI_FORMAT_RJ:
-			/* Tight packing: slot_width == ch_width, so same as LJ. */
-			fslen  = sc->ch_width;
-			ch1pos = 0;
-			ch2pos = sc->ch_width;
-			break;
-		case AUDIO_DAI_FORMAT_DSPA:
-			mode |= MODE_A_FSI;
-			fslen  = 1;
-			ch1pos = 1;
-			ch2pos = sc->ch_width + 1;
-			break;
-		case AUDIO_DAI_FORMAT_DSPB:
-			fslen  = 1;
-			ch1pos = 0;
-			ch2pos = sc->ch_width;
-			break;
-		default:
-			return (EINVAL);
+	case AUDIO_DAI_FORMAT_I2S:
+		/*
+		 * BCM2835 §8.2: FS is HIGH during the first half-frame (CH1 =
+		 * left channel) by default.  Modern codecs (PCM5102, WM8731,
+		 * …) use LRCLK=HIGH=LEFT, so no inversion is needed here.
+		 * Codecs that follow the original Philips convention
+		 * (WS=0=LEFT) must set frame-inversion polarity in their DTS
+		 * node; the MODE_A_FSI toggle below handles that case.
+		 * CH1 data begins one BCLK after the FS edge (I2S delay).
+		 */
+		fslen  = sc->ch_width;
+		ch1pos = 1;
+		ch2pos = sc->ch_width + 1;
+		break;
+	case AUDIO_DAI_FORMAT_LJ:
+		fslen  = sc->ch_width;
+		ch1pos = 0;
+		ch2pos = sc->ch_width;
+		break;
+	case AUDIO_DAI_FORMAT_RJ:
+		/*
+		 * Right-justified within the slot.  With tight packing
+		 * (slot_width == ch_width) this is identical to LJ.
+		 * set_chanformat recomputes once the actual sample width
+		 * is known, placing samples at the right edge of each slot.
+		 */
+		fslen  = sc->ch_width;
+		ch1pos = 0;
+		ch2pos = sc->ch_width;
+		break;
+	case AUDIO_DAI_FORMAT_DSPA:
+		mode |= MODE_A_FSI;
+		fslen  = 1;
+		ch1pos = 1;
+		ch2pos = sc->ch_width + 1;
+		break;
+	case AUDIO_DAI_FORMAT_DSPB:
+		fslen  = 1;
+		ch1pos = 0;
+		ch2pos = sc->ch_width;
+		break;
+	default:
+		return (EINVAL);
 	}
 
 	if (AUDIO_DAI_POLARITY_INVERTED_BCLK(pol))
@@ -288,8 +317,7 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 
 	mode |= MODE_A_FLEN(flen - 1) | MODE_A_FSLEN(fslen);
 
-	/* Store DAI format and initial frame geometry for set_chanformat. */
-	sc->dai_fmt  = fmt;
+	sc->dai_fmt   = fmt;
 	sc->frame_len = flen;
 
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_EN); /* Enable PCM Block */
@@ -304,9 +332,27 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_TXC_A, chc);
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_RXC_A, chc);
 
+	/* Step 3 */
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTEN_A, 0);
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A,
-	    INTx_A_RXERR | INTx_A_TXERR | INTx_A_RXR | INTx_A_TXW);
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, INTx_A_ALL);
+
+	/*
+	 * DREQ thresholds: TX panic at ≤16 words (empty quarter), normal at
+	 * ≤16 words; RX panic at ≥48 words (full three-quarters), normal at
+	 * ≥48 words.  These apply when DMA is enabled (CS_A_DMAEN); the IRQ
+	 * path uses TXTHR/RXTHR instead but setting DREQ_A costs nothing.
+	 */
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_DREQ_A,
+	    DREQ_A_TX_PANIC(0x10) | DREQ_A_RX_PANIC(0x30) |
+	    DREQ_A_TX(0x10)       | DREQ_A_RX(0x30));
+
+	/* Release standby, then wait ≥4 PCM clocks. */
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, CS_A_EN | CS_A_STBY);
+	bcm2835_i2s_sync_wait(sc, 4);
+
+	/* Step 6: flush FIFOs; RXSEX sign-extends narrow RX samples to 32 b. */
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A,
+	    CS_A_EN | CS_A_STBY | CS_A_TXCLR | CS_A_RXCLR | CS_A_RXSEX);
 
 	return (0);
 }
@@ -327,6 +373,18 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 	intstc = BCM2835_I2S_READ_4(sc, BCM_I2S_INTSTC_A);
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A, intstc);
 
+	/* FIFO error recovery: flush the offending FIFO and clear the latch. */
+	if (intstc & (INTx_A_TXERR | INTx_A_RXERR)) {
+		uint32_t cs_err = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
+		if (intstc & INTx_A_TXERR)
+			cs_err |= CS_A_TXCLR;
+		if (intstc & INTx_A_RXERR)
+			cs_err |= CS_A_RXCLR;
+		BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs_err);
+		BCM2835_I2S_WRITE_4(sc, BCM_I2S_INTSTC_A,
+		    intstc & (INTx_A_TXERR | INTx_A_RXERR));
+	}
+
 	/* If a TXW interrupt occurred */
 	if (intstc & INTx_A_TXW) {
 		uint8_t *samples;
@@ -334,7 +392,7 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 		int bps, frame_bytes;
 
 		bps         = sc->bytes_per_sample;
-		frame_bytes = bps * 2; /* one stereo frame */
+		frame_bytes = bps * sc->num_channels;
 		count    = sndbuf_getready(play_buf);
 		size     = play_buf->bufsize;
 		readyptr = sndbuf_getreadyptr(play_buf);
@@ -364,11 +422,12 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 				written += frame_bytes;
 				count   -= frame_bytes;
 			}
-		} else {
+		} else { // TODO: Potentially incorrect else implementation
 			/*
-			 * FTXP=0: each FIFO word carries one channel.
-			 * Write L then R, checking TXD once per pair to avoid
-			 * splitting a stereo frame across a FIFO-full boundary.
+			 * FTXP=0: one FIFO word per enabled channel.
+			 * Mono: write CH1 only (CH2 disabled in TXC_A).
+			 * Stereo: write CH1 then CH2 in one TXD check to avoid
+			 * splitting a frame across a FIFO-full boundary.
 			 */
 			while (count >= (uint32_t)frame_bytes) {
 				cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
@@ -380,10 +439,12 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 				        readyptr, size, bps));
 				readyptr += bps;
 
-				BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A,
-				    bcm2835_i2s_pack_sample(samples,
-				        readyptr, size, bps));
-				readyptr += bps;
+				if (sc->num_channels == 2) {
+					BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A,
+					    bcm2835_i2s_pack_sample(samples,
+					        readyptr, size, bps));
+					readyptr += bps;
+				}
 
 				written += frame_bytes;
 				count   -= frame_bytes;
@@ -402,7 +463,7 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 		int bps, frame_bytes;
 
 		bps         = sc->bytes_per_sample;
-		frame_bytes = bps * 2; /* one stereo frame */
+		frame_bytes = bps * sc->num_channels;
 		count    = sndbuf_getfree(rec_buf);
 		size     = rec_buf->bufsize;
 		freeptr  = sndbuf_getfreeptr(rec_buf);
@@ -430,8 +491,8 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 				recorded += frame_bytes;
 				count    -= frame_bytes;
 			}
-		} else {
-			/* FRXP=0: each FIFO word carries one channel. */
+		} else { // TODO: Potentially incorrect else implementation
+			/* FRXP=0: one FIFO word per enabled channel. */
 			while (count >= (uint32_t)frame_bytes) {
 				cs = BCM2835_I2S_READ_4(sc, BCM_I2S_CS_A);
 				if (!(cs & CS_A_RXD))
@@ -442,10 +503,13 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 				    size, val, bps);
 				freeptr += bps;
 
-				val = BCM2835_I2S_READ_4(sc, BCM_I2S_FIFO_A);
-				bcm2835_i2s_unpack_sample(samples, freeptr,
-				    size, val, bps);
-				freeptr += bps;
+				if (sc->num_channels == 2) {
+					val = BCM2835_I2S_READ_4(sc,
+					    BCM_I2S_FIFO_A);
+					bcm2835_i2s_unpack_sample(samples,
+					    freeptr, size, val, bps);
+					freeptr += bps;
+				}
 
 				recorded += frame_bytes;
 				count    -= frame_bytes;
@@ -486,7 +550,7 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 					/*
 					 * Already transmitting: the PCM layer re-triggers
 					 * after each ISR callback.  Just keep the interrupt
-					 * armed and return — do NOT clear the FIFO or
+					 * armed and return — dont clear the FIFO or
 					 * re-prefill with silence, which would glitch audio.
 					 */
 					inten = BCM2835_I2S_READ_4(sc, BCM_I2S_INTEN_A);
@@ -495,6 +559,7 @@ bcm2835_i2s_dai_trigger(device_t dev, int go, int pcm_dir)
 					break;
 				}
 
+				// TODO: Prefill with known audio data instead of silence
 				/* First start: clear FIFO, prefill silence, then enable TX. */
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, cs | CS_A_TXCLR);
 				bcm2835_i2s_sync_wait(sc, 2);
@@ -592,30 +657,33 @@ bcm2835_i2s_dai_setup_intr(device_t dev, driver_intr_t intr_handler,
 	return (0);
 }
 
-// Runs 3rd after init (2nd in loop)
 static uint32_t
 bcm2835_i2s_dai_set_chanformat(device_t dev, uint32_t format)
 {
 	struct bcm2835_i2s_softc *sc;
-	uint32_t chc, mode;
-	int ch_width, bps, frame_len, fslen, ch1pos, ch2pos, wid;
-	bool wex;
+	uint32_t chc_tx, chc_rx, mode;
+	int ch_width, bps, num_ch, frame_len, fslen, ch1pos, ch2pos, wid;
+	bool wex, packed;
 
 	sc = device_get_softc(dev);
 
 	device_printf(dev, "Set chanformat: format=%u\n", format);
 
-	ch_width = AFMT_BIT(format); // For example, AFMT_S16_LE → 16, AFMT_S32_LE → 32
-	bps      = AFMT_BPS(format); // For example, AFMT_S16_LE → 2, AFMT_S32_LE → 4
+	ch_width = AFMT_BIT(format);
+	bps      = AFMT_BPS(format);
+	num_ch   = AFMT_CHANNEL(format);	/* 1 = mono, 2 = stereo */
 
+	/*
+	 * Wire frame always spans two slots for I2S/LJ/RJ compatibility —
+	 * FLEN covers both channels regardless of num_ch.  FIFO depth per
+	 * frame is num_ch words (one per enabled channel).
+	 */
 	frame_len = 2 * ch_width;
 	wid = ch_width - 8;
 	wex = (ch_width > 23);
 
-	/* Channel positions depend on the DAI format stored at dai_init time. */
 	switch (sc->dai_fmt) {
 	case AUDIO_DAI_FORMAT_I2S:
-		/* One BCLK delay after FS edge (I2S spec). */
 		fslen  = ch_width;
 		ch1pos = 1;
 		ch2pos = ch_width + 1;
@@ -626,7 +694,13 @@ bcm2835_i2s_dai_set_chanformat(device_t dev, uint32_t format)
 		ch2pos = ch_width;
 		break;
 	case AUDIO_DAI_FORMAT_RJ:
-		/* Tight packing: slot_width == ch_width → equivalent to LJ. */
+		/*
+		 * Right-justified: samples sit at the right edge of each slot.
+		 * With tight packing slot_width == ch_width so positions
+		 * coincide with LJ.  When a future DT slot-width property is
+		 * added, ch1pos = slot_width - ch_width and
+		 * ch2pos = 2*slot_width - ch_width.
+		 */
 		fslen  = ch_width;
 		ch1pos = 0;
 		ch2pos = ch_width;
@@ -646,59 +720,59 @@ bcm2835_i2s_dai_set_chanformat(device_t dev, uint32_t format)
 	}
 
 	/*
-	 * Packed frame mode (FTXP/FRXP): the hardware merges both stereo
-	 * channels into one 32-bit FIFO word (CH1 in [15:0], CH2 in [31:16]).
-	 * This halves FIFO traffic but is limited to ch_width <= 16 bits.
+	 * Packed mode (FTXP/FRXP): hardware merges both stereo channels into
+	 * one 32-bit FIFO word (CH1 in [15:0], CH2 in [31:16]).  Only valid
+	 * for stereo ≤16-bit; mono uses one unpacked FIFO word per frame.
 	 */
-	bool packed = (ch_width <= 16);
+	packed = (ch_width <= 16) && (num_ch == 2);
 
-	/*
-	 * Update frame geometry and packed-mode bits in MODE_A, preserving
-	 * the clock and polarity bits (CLKM, CLKI, FSM, FSI, CLK_DIS).
-	 */
 	mode = BCM2835_I2S_READ_4(sc, BCM_I2S_MODE_A);
-	
-	mode &= ~(MODE_A_FLEN(0x3ff) | MODE_A_FSLEN(0x3ff) | MODE_A_FTXP | MODE_A_FRXP);
-	
+	mode &= ~(MODE_A_FLEN(0x3ff) | MODE_A_FSLEN(0x3ff) |
+	    MODE_A_FTXP | MODE_A_FRXP);
 	mode |= MODE_A_FLEN(frame_len - 1) | MODE_A_FSLEN(fslen);
-	
-	if (packed){
+	if (packed)
 		mode |= MODE_A_FTXP | MODE_A_FRXP;
-	}
-
 	BCM2835_I2S_WRITE_4(sc, BCM_I2S_MODE_A, mode);
 
-	chc = (wex ? CHxC_CH1WEX : 0) |
-	    CHxC_CH1EN | CHxC_CH1POS(ch1pos) | CHxC_CH1WID(wid) |
-	    (wex ? CHxC_CH2WEX : 0) |
-	    CHxC_CH2EN | CHxC_CH2POS(ch2pos) | CHxC_CH2WID(wid);
+	/*
+	 * For stereo enable both channels; for mono enable CH1 only.
+	 * CH2 disabled in mono: hardware outputs silence on the right slot
+	 * (TX) and discards right-slot data (RX).
+	 */
+	chc_tx = (wex ? CHxC_CH1WEX : 0) |
+	    CHxC_CH1EN | CHxC_CH1POS(ch1pos) | CHxC_CH1WID(wid);
+	chc_rx = chc_tx;
 
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_TXC_A, chc);
-	BCM2835_I2S_WRITE_4(sc, BCM_I2S_RXC_A, chc);
+	if (num_ch == 2) {
+		chc_tx |= (wex ? CHxC_CH2WEX : 0) |
+		    CHxC_CH2EN | CHxC_CH2POS(ch2pos) | CHxC_CH2WID(wid);
+		chc_rx  = chc_tx;
+	}
+
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_TXC_A, chc_tx);
+	BCM2835_I2S_WRITE_4(sc, BCM_I2S_RXC_A, chc_rx);
 
 	BCM2835_I2S_LOCK(sc);
 	sc->frame_len        = frame_len;
 	sc->ch_width         = ch_width;
 	sc->bytes_per_sample = bps;
+	sc->num_channels     = num_ch;
 	sc->packed_mode      = packed;
 	BCM2835_I2S_UNLOCK(sc);
 
 	return (0);
 }
 
-// Never called
 static int
-bcm2835_i2s_dai_set_sysclk(device_t dev, unsigned int rate, int dai_dir)
+bcm2835_i2s_dai_set_sysclk(device_t dev __unused, unsigned int rate __unused,
+    int dai_dir __unused)
 {
-	device_printf(dev, "Set sysclk: rate=%u, dir=%d\n", rate, dai_dir);
-	(void)dev;
-	(void)rate;
-	(void)dai_dir;
-
+	/*
+	TODO: Look into what this is supposed to do
+	 */
 	return (0);
 }
 
-// Runs 2nd after init (1st in loop)
 static uint32_t
 bcm2835_i2s_dai_set_chanspeed(device_t dev, uint32_t speed)
 {
@@ -710,15 +784,6 @@ bcm2835_i2s_dai_set_chanspeed(device_t dev, uint32_t speed)
 		return (speed);
 
 
-	device_printf(dev, "Set chanspeed: speed=%u\n, packed=%d\n", speed, sc->packed_mode);
-
-	/*
-	 * TXTHR=1: TXW fires when TX FIFO < 3/4 full (16 words free, ~1ms at 8kHz).
-	 * TXTHR=2: TXW fires when TX FIFO < 1/2 full (32 words free, ~333us at 48kHz).
-	 * Higher rates drain the FIFO faster so we fire earlier to avoid underrun.
-	 * RXTHR=1: RXR fires when RX FIFO >= 1/4 full (16 words), leaving 48 words
-	 * of headroom before overflow at any supported rate.
-	 */
 	sc->txthr = (speed > 16000) ? 2 : 1;
 	sc->rxthr = 1;
 
@@ -735,8 +800,6 @@ bcm2835_i2s_dai_set_chanspeed(device_t dev, uint32_t speed)
 		    speed);
 		return (speed);
 	}
-	device_printf(sc->dev, "PCM clock set to %u Hz for requested rate %u Hz\n when frame length is %u\n",
-	    actual_bclk, speed, sc->frame_len);
 
 	/*
 	 * Return the actual achieved rate so the PCM layer can insert
@@ -748,16 +811,16 @@ bcm2835_i2s_dai_set_chanspeed(device_t dev, uint32_t speed)
 }
 
 static device_method_t bcm2835_i2s_methods[] = {
-	DEVMETHOD(device_probe,			bcm2835_i2s_probe),
-	DEVMETHOD(device_attach,		bcm2835_i2s_attach),
-	DEVMETHOD(device_detach,		bcm2835_i2s_detach),
+	DEVMETHOD(device_probe,				bcm2835_i2s_probe),
+	DEVMETHOD(device_attach,			bcm2835_i2s_attach),
+	DEVMETHOD(device_detach,			bcm2835_i2s_detach),
 
-	DEVMETHOD(audio_dai_init,		bcm2835_i2s_dai_init),
+	DEVMETHOD(audio_dai_init,			bcm2835_i2s_dai_init),
 	DEVMETHOD(audio_dai_setup_intr,		bcm2835_i2s_dai_setup_intr),
 	DEVMETHOD(audio_dai_set_sysclk,		bcm2835_i2s_dai_set_sysclk),
 	DEVMETHOD(audio_dai_set_chanspeed,	bcm2835_i2s_dai_set_chanspeed),
 	DEVMETHOD(audio_dai_set_chanformat,	bcm2835_i2s_dai_set_chanformat),
-	DEVMETHOD(audio_dai_intr,		bcm2835_i2s_dai_intr),
+	DEVMETHOD(audio_dai_intr,			bcm2835_i2s_dai_intr),
 	DEVMETHOD(audio_dai_get_caps,		bcm2835_i2s_dai_get_caps),
 	DEVMETHOD(audio_dai_trigger,		bcm2835_i2s_dai_trigger),
 	DEVMETHOD(audio_dai_get_ptr,		bcm2835_i2s_dai_get_ptr),
