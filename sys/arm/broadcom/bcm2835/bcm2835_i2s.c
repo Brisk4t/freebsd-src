@@ -398,9 +398,10 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 		if (sc->packed_mode) {
 			/*
 			 * FTXP=1: one 32-bit FIFO word carries both channels.
-			 * The BCM2835 shifts PCM bits MSB first, so channel 1
-			 * occupies the lower half-word and channel 2 the upper
-			 * half-word per the FIFO packing rules.
+			 * The BCM2835 packs least-significant sample first, so
+			 * channel 1 (left) occupies the lower half-word [15:0]
+			 * and channel 2 (right) the upper half-word [31:16].
+			 * Within each half-word bits are ordered MSB first.
 			 * Check TXD once per stereo frame.
 			 */
 			while (count >= (uint32_t)frame_bytes) {
