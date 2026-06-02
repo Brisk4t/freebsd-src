@@ -105,11 +105,12 @@ static struct pcmchan_caps bcm2835_i2s_caps = {
 };
 
 /*
- * Pack bps bytes from a circular buffer starting at pos into a 32-bit
- * FIFO word (little-endian byte order, sample in the low bits).
+ * Pack bps bytes from the PCM ring buffer into a 32-bit FIFO word.
+ * Bytes are assembled little-endian (byte 0 → bits [7:0]).  The modulo
+ * wrap handles the rare case where a sample straddles the ring boundary.
  */
 static inline uint32_t
-bcm2835_i2s_pack_sample(const uint8_t *buf, uint32_t pos, uint32_t size,
+bcm2835_i2s_assemble_sample(const uint8_t *buf, uint32_t pos, uint32_t size,
     int bps)
 {
 	uint32_t v = 0;
@@ -121,10 +122,10 @@ bcm2835_i2s_pack_sample(const uint8_t *buf, uint32_t pos, uint32_t size,
 }
 
 /*
- * Unpack a 32-bit FIFO word into bps bytes in a circular buffer.
+ * Scatter a 32-bit FIFO word into bps little-endian bytes in the PCM ring buffer.
  */
 static inline void
-bcm2835_i2s_unpack_sample(uint8_t *buf, uint32_t pos, uint32_t size,
+bcm2835_i2s_scatter_sample(uint8_t *buf, uint32_t pos, uint32_t size,
     uint32_t val, int bps)
 {
 	int i;
@@ -153,6 +154,7 @@ bcm2835_i2s_detach(device_t dev)
 
 	sc = device_get_softc(dev);
 
+	/* Disable the PCM block on detach */
 	if (sc->hw_started) {
 		BCM2835_I2S_WRITE_4(sc, BCM_I2S_CS_A, 0);
 		sc->hw_started = false;
@@ -240,6 +242,7 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 	clk = AUDIO_DAI_FORMAT_CLOCK(format);
 
 	mode = 0;
+	flen = 2 * sc->ch_width;
 
 	switch (clk) {
 		case AUDIO_DAI_CLOCK_CBM_CFM:
@@ -256,14 +259,7 @@ bcm2835_i2s_dai_init(device_t dev, uint32_t format)
 		default:
 			return (EINVAL);
 	}
-
-	/*
-	 * Compute initial frame geometry using the default channel width.
-	 * set_chanformat will recalculate when the PCM format is known.
-	 * Frame length = 2 × ch_width (tight packing, one slot per channel).
-	 */
-	flen = 2 * sc->ch_width;
-
+	
 	switch (fmt) {
 	case AUDIO_DAI_FORMAT_I2S:
 		/*
@@ -413,16 +409,18 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 					break;
 
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A,
-				    bcm2835_i2s_pack_sample(samples,
+				    bcm2835_i2s_assemble_sample(samples,
 				        readyptr, size, bps) |
-				    (bcm2835_i2s_pack_sample(samples,
+				    (bcm2835_i2s_assemble_sample(samples,
 				        readyptr + bps, size, bps) << 16));
 				readyptr += frame_bytes;
 
 				written += frame_bytes;
 				count   -= frame_bytes;
 			}
-		} else { // TODO: Potentially incorrect else implementation
+		} 
+		
+		else {
 			/*
 			 * FTXP=0: one FIFO word per enabled channel.
 			 * Mono: write CH1 only (CH2 disabled in TXC_A).
@@ -435,13 +433,13 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 					break;
 
 				BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A,
-				    bcm2835_i2s_pack_sample(samples,
+				    bcm2835_i2s_assemble_sample(samples,
 				        readyptr, size, bps));
 				readyptr += bps;
 
 				if (sc->num_channels == 2) {
 					BCM2835_I2S_WRITE_4(sc, BCM_I2S_FIFO_A,
-					    bcm2835_i2s_pack_sample(samples,
+					    bcm2835_i2s_assemble_sample(samples,
 					        readyptr, size, bps));
 					readyptr += bps;
 				}
@@ -482,9 +480,9 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 					break;
 
 				val = BCM2835_I2S_READ_4(sc, BCM_I2S_FIFO_A);
-				bcm2835_i2s_unpack_sample(samples, freeptr,
+				bcm2835_i2s_scatter_sample(samples, freeptr,
 				    size, val, bps);               /* L */
-				bcm2835_i2s_unpack_sample(samples, freeptr + bps,
+				bcm2835_i2s_scatter_sample(samples, freeptr + bps,
 				    size, val >> 16, bps);         /* R */
 				freeptr += frame_bytes;
 
@@ -499,14 +497,14 @@ bcm2835_i2s_dai_intr(device_t dev, struct snd_dbuf *play_buf,
 					break;
 
 				val = BCM2835_I2S_READ_4(sc, BCM_I2S_FIFO_A);
-				bcm2835_i2s_unpack_sample(samples, freeptr,
+				bcm2835_i2s_scatter_sample(samples, freeptr,
 				    size, val, bps);
 				freeptr += bps;
 
 				if (sc->num_channels == 2) {
 					val = BCM2835_I2S_READ_4(sc,
 					    BCM_I2S_FIFO_A);
-					bcm2835_i2s_unpack_sample(samples,
+					bcm2835_i2s_scatter_sample(samples,
 					    freeptr, size, val, bps);
 					freeptr += bps;
 				}
@@ -667,8 +665,6 @@ bcm2835_i2s_dai_set_chanformat(device_t dev, uint32_t format)
 
 	sc = device_get_softc(dev);
 
-	device_printf(dev, "Set chanformat: format=%u\n", format);
-
 	ch_width = AFMT_BIT(format);
 	bps      = AFMT_BPS(format);
 	num_ch   = AFMT_CHANNEL(format);	/* 1 = mono, 2 = stereo */
@@ -801,10 +797,6 @@ bcm2835_i2s_dai_set_chanspeed(device_t dev, uint32_t speed)
 		return (speed);
 	}
 
-	/*
-	 * Return the actual achieved rate so the PCM layer can insert
-	 * feeder_rate to compensate for clock-divider rounding.
-	 */
 	actual_rate = actual_bclk / sc->frame_len;
 	sc->sample_rate = actual_rate;
 	return (actual_rate);
